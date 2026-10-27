@@ -1,6 +1,7 @@
 packages:
   - 'packages/*'
 allowBuilds:
+  '@parcel/watcher': set this to true or false
   esbuild: true
   leveldown: true
   sharp: set this to true or false

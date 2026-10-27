@@ -20,6 +20,11 @@ import {
   detectLanguage,
   moveNode,
 } from '@/lib/workspace'
+import {
+  SemanticGuardPipeline,
+  SemanticDiagnostic,
+  WorkspaceFileSnapshot,
+} from '@/lib/semantic-guard'
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), {
   ssr: false,
@@ -49,6 +54,10 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
   const [nodes, setNodes] = useState<WorkspaceNode[]>([])
   const [openFileIds, setOpenFileIds] = useState<string[]>([])
   const [activeFileId, setActiveFileId] = useState<string | null>(null)
+
+  // ── Semantic Guard state ───────────────────────────────────────────────────
+  const [diagnostics, setDiagnostics] = useState<SemanticDiagnostic[]>([])
+  const pipelineRef = useRef<SemanticGuardPipeline | null>(null)
 
   // Initialize workspace map & subscribe to remote file tree changes
   useEffect(() => {
@@ -150,6 +159,68 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
     }
   }, [doc, provider, monacoReady, activeFileId, nodes])
 
+  // ── Semantic Guard Pipeline Initialization & Merge Tracking ──────────────
+  useEffect(() => {
+    if (!doc) return
+    const pipeline = new SemanticGuardPipeline(undefined, 250)
+    pipelineRef.current = pipeline
+
+    pipeline.onUpdate((fileId, diags) => {
+      if (fileId === activeFileId || diags.length === 0) {
+        setDiagnostics(diags)
+      }
+    })
+
+    const handleDocUpdate = (_u: Uint8Array, origin: any) => {
+      // If update originated remotely or from partition heal, record merge event
+      if (origin !== doc.clientID) {
+        pipeline.recordMergeEvent({
+          occurred: true,
+          sourceClientId: typeof origin === 'number' ? origin : undefined,
+        })
+      }
+    }
+
+    doc.on('update', handleDocUpdate)
+
+    return () => {
+      doc.off('update', handleDocUpdate)
+      pipeline.dispose()
+      pipelineRef.current = null
+    }
+  }, [doc, activeFileId])
+
+  // Trigger analysis when active file, monaco model, or workspace nodes change
+  useEffect(() => {
+    if (!doc || !activeFileId || !monacoReady || !editorRef.current) return
+
+    const editor = editorRef.current
+    const model = editor.getModel()
+    const monacoGlobal = (window as any).monaco
+    if (model && monacoGlobal) {
+      pipelineRef.current?.bindMonaco(monacoGlobal, model)
+    }
+
+    const runAnalysis = () => {
+      const fileSnapshots: WorkspaceFileSnapshot[] = nodes
+        .filter((n) => n.type === 'file')
+        .map((n) => ({
+          id: n.id,
+          name: n.name,
+          content: doc.getText(`file:${n.id}`).toString(),
+        }))
+      pipelineRef.current?.triggerAnalysis(activeFileId, fileSnapshots)
+    }
+
+    runAnalysis()
+
+    const yText = doc.getText(`file:${activeFileId}`)
+    yText.observe(runAnalysis)
+    return () => {
+      yText.unobserve(runAnalysis)
+    }
+  }, [doc, activeFileId, monacoReady, nodes])
+
   // File tree operations
   const handleSelectFile = (fileId: string) => {
     if (!openFileIds.includes(fileId)) {
@@ -232,6 +303,68 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
               {chaos.divergedChars} unseen edit{chaos.divergedChars !== 1 ? 's' : ''}
             </span>
           )}
+
+          {/* Semantic Guard Status Badge */}
+          {(() => {
+            const confirmedCount = diagnostics.filter(
+              (d) => d.category === 'CONFIRMED_CONCURRENT_CONFLICT'
+            ).length
+            const likelyCount = diagnostics.filter(
+              (d) => d.category === 'LIKELY_CONCURRENT_CONFLICT'
+            ).length
+            const totalErrors = diagnostics.length
+
+            if (confirmedCount > 0) {
+              return (
+                <span
+                  className="pane-diverge-pill"
+                  style={{ background: '#ef4444', color: '#fff', fontWeight: 600 }}
+                  title={
+                    diagnostics.find(
+                      (d) => d.category === 'CONFIRMED_CONCURRENT_CONFLICT'
+                    )?.message
+                  }
+                >
+                  ⚠️ Semantic Conflict ({confirmedCount})
+                </span>
+              )
+            }
+            if (likelyCount > 0) {
+              return (
+                <span
+                  className="pane-diverge-pill"
+                  style={{ background: '#f59e0b', color: '#000', fontWeight: 600 }}
+                  title={
+                    diagnostics.find(
+                      (d) => d.category === 'LIKELY_CONCURRENT_CONFLICT'
+                    )?.message
+                  }
+                >
+                  ⚡ Likely Conflict ({likelyCount})
+                </span>
+              )
+            }
+            if (totalErrors > 0) {
+              return (
+                <span
+                  className="pane-diverge-pill"
+                  style={{ background: '#f43f5e', color: '#fff' }}
+                  title={`${totalErrors} diagnostic issue(s)`}
+                >
+                  ❌ {totalErrors} Issue{totalErrors > 1 ? 's' : ''}
+                </span>
+              )
+            }
+            return (
+              <span
+                className="pane-diverge-pill"
+                style={{ background: '#10b981', color: '#fff' }}
+                title="Semantic Guard: 0 AST errors detected"
+              >
+                🛡️ Clean
+              </span>
+            )
+          })()}
         </div>
         <ConnectionStatusBadge
           status={status}

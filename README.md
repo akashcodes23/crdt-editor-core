@@ -66,6 +66,11 @@
 * **Telemetry HUD**: Live inspection of Lamport Vector Clocks and byte-level comparison of delta sync vs full state reload.
 * **Merge Flash**: Visual highlight highlighting reconciled ranges when disconnected peers merge back into the swarm.
 
+### 4. Semantic Guard (AST Post-Convergence Analysis)
+* **Semantic Conflict Detection**: In-memory TypeScript AST checker detecting compile-time errors that survive clean CRDT text merges (e.g., concurrent declaration renames vs. reference calls).
+* **Attribution Engine**: Causal classifier distinguishing syntax errors, single-user static diagnostics, and confirmed concurrent merge conflicts.
+* **Debounced Scheduler**: Low-overhead background analysis (1.81 ms median) with automatic stale-result rejection and keystroke superseding.
+
 ---
 
 ## 📊 Measured Performance Benchmarks
@@ -86,6 +91,8 @@ All metrics represent real measurements executed on Apple Silicon (`darwin arm64
 | **Cold Recovery Speedup (Snapshot vs Replay)** | **3.75x faster** (Median: 0.20 ms vs 0.76 ms) |
 | **Storage Compaction Ratio** | **75.62% reduction** (7,456 bytes $\to$ 1,818 bytes) |
 | **PostgreSQL Single-Row Write Latency** | **0.29 ms** (P50: 0.20 ms, P95: 0.48 ms) |
+| **Semantic Guard AST Analysis (Small File)** | **1.81 ms** (Median, P95: 5.54 ms) |
+| **Semantic Guard Burst Keystroke Cancellation** | **90.0% reduction** in redundant compilation work |
 | **50-Replica In-Memory Swarm Convergence** | **13.13 ms** across 50 in-memory peer replicas |
 
 ---
@@ -116,7 +123,7 @@ pnpm dev
 * **Frontend**: [http://localhost:3000](http://localhost:3000)
 * **WebSocket / HTTP Server**: `http://localhost:1234` (`ws://localhost:1234`)
 
-### 4. Run Convergence Tests
+### 4. Run Convergence & Semantic Tests
 ```bash
 pnpm test
 ```
@@ -130,13 +137,14 @@ pnpm benchmark
 
 ## 🧪 Testing Standard
 
-Run the formal verification suite (31 unit & integration tests):
+Run the formal verification suite (42 unit & integration tests):
 
 ```bash
 pnpm --filter server test
 ```
 
 ```
+PASS src/__tests__/semantic-guard.test.ts
 PASS src/__tests__/compaction-races-and-recovery.test.ts
 PASS src/__tests__/hlc-semantics.test.ts
 PASS src/__tests__/distributed-correctness.test.ts
@@ -144,10 +152,10 @@ PASS src/__tests__/workspace-invariants.test.ts
 PASS src/__tests__/hlc-and-recovery.test.ts
 PASS src/__tests__/crdt-convergence.test.ts
 
-Test Suites: 6 passed, 6 total
-Tests:       31 passed, 31 total
+Test Suites: 7 passed, 7 total
+Tests:       42 passed, 42 total
 Snapshots:   0 total
-Time:        0.633 s
+Time:        1.236 s
 ```
 
 ---
@@ -155,6 +163,7 @@ Time:        0.633 s
 ## 📚 Technical Documentation
 
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): Distributed systems design, wire protocols, and recovery pipeline.
+* [`docs/SEMANTIC_GUARD.md`](docs/SEMANTIC_GUARD.md): AST-based static analysis and concurrent conflict attribution.
 * [`docs/RECOVERY.md`](docs/RECOVERY.md): Persistence, compaction, historical replay, and recovery contract.
 * [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md): Reproducible performance measurements, methodology, and hardware specification.
 * [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md): CRDT workspace tree representation, cycle-breaking invariants, and concurrency policies.
