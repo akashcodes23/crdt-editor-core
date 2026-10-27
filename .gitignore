@@ -6,8 +6,13 @@ node_modules/
 .next/
 out/
 
+# Build artifacts
+dist/
+**/dist/
+
 # TypeScript build info
 *.tsbuildinfo
+**/*.tsbuildinfo
 next-env.d.ts
 
 # Server runtime data (LevelDB)

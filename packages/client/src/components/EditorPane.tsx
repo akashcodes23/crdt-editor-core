@@ -7,11 +7,18 @@ import { MonacoBinding } from 'y-monaco'
 import { ConnectionStatusBadge } from './ConnectionStatus'
 import { VectorClockSidebar } from './VectorClockSidebar'
 import { CursorOverlay } from './CursorOverlay'
+import { FileExplorer } from './FileExplorer'
+import { EditorTabBar } from './EditorTabBar'
 import { useYDoc } from '@/hooks/useYDoc'
 import { useAwareness, setAwarenessCursor } from '@/hooks/useAwareness'
 import { useVectorClock } from '@/hooks/useVectorClock'
-import { getSharedText } from '@/lib/yjs'
 import { colorFromClientId } from '@/lib/colors'
+import {
+  WorkspaceNode,
+  getWorkspaceMap,
+  initializeStarterWorkspace,
+  detectLanguage,
+} from '@/lib/workspace'
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), {
   ssr: false,
@@ -37,36 +44,169 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
   const bindingRef   = useRef<MonacoBinding | null>(null)
   const [monacoReady, setMonacoReady] = useState(false)
 
+  // ── Multi-file state ────────────────────────────────────────────────────────
+  const [nodes, setNodes] = useState<WorkspaceNode[]>([])
+  const [openFileIds, setOpenFileIds] = useState<string[]>([])
+  const [activeFileId, setActiveFileId] = useState<string | null>(null)
+
+  // Initialize workspace map & subscribe to remote file tree changes
+  useEffect(() => {
+    if (!doc) return
+    const wsMap = getWorkspaceMap(doc)
+
+    // Seed starter files if empty
+    initializeStarterWorkspace(doc)
+
+    const syncNodes = () => {
+      const arr: WorkspaceNode[] = []
+      wsMap.forEach((node) => arr.push(node))
+      arr.sort((a, b) => a.createdAt - b.createdAt)
+      setNodes(arr)
+
+      // Ensure at least one file is active if none is selected
+      if (arr.length > 0) {
+        setOpenFileIds((prev) => {
+          if (prev.length === 0) return [arr[0].id]
+          // Filter out deleted files
+          const valid = prev.filter((id) => wsMap.has(id))
+          return valid.length > 0 ? valid : [arr[0].id]
+        })
+        setActiveFileId((curr) => {
+          if (curr && wsMap.has(curr)) return curr
+          return arr[0].id
+        })
+      }
+    }
+
+    syncNodes()
+    wsMap.observe(syncNodes)
+    return () => {
+      wsMap.unobserve(syncNodes)
+    }
+  }, [doc])
+
+  // Handle Monaco mounting
   const handleEditorMount = useCallback(
     (editor: monaco.editor.IStandaloneCodeEditor) => {
       editorRef.current = editor
       setMonacoReady(true)
+
       editor.onDidChangeCursorSelection((e) => {
         const model = editor.getModel()
         if (!model) return
         const sel = e.selection
         setAwarenessCursor(provider, {
-          index:  model.getOffsetAt({ lineNumber: sel.startLineNumber, column: sel.startColumn }),
-          length: model.getOffsetAt({ lineNumber: sel.endLineNumber,   column: sel.endColumn }) -
-                  model.getOffsetAt({ lineNumber: sel.startLineNumber, column: sel.startColumn }),
+          index: model.getOffsetAt({ lineNumber: sel.startLineNumber, column: sel.startColumn }),
+          length:
+            model.getOffsetAt({ lineNumber: sel.endLineNumber, column: sel.endColumn }) -
+            model.getOffsetAt({ lineNumber: sel.startLineNumber, column: sel.startColumn }),
         })
       })
     },
     [provider]
   )
 
+  // Bind active file to Monaco whenever activeFileId changes
   useEffect(() => {
-    if (!doc || !provider || !editorRef.current || !monacoReady) return
-    const yText   = getSharedText(doc)
-    const binding = new MonacoBinding(
-      yText, editorRef.current.getModel()!,
-      new Set([editorRef.current]), provider.awareness
-    )
-    bindingRef.current = binding
-    return () => { binding.destroy(); bindingRef.current = null }
-  }, [doc, provider, monacoReady])
+    if (!doc || !provider || !editorRef.current || !monacoReady || !activeFileId) return
 
-  const accentColor  = doc ? colorFromClientId(doc.clientID * (side === 'left' ? 1 : 3)) : '#6ee7b7'
+    const activeNode = nodes.find((n) => n.id === activeFileId)
+    const targetKey = `file:${activeFileId}`
+    const yText = doc.getText(targetKey)
+
+    // Clean up existing binding before creating new one
+    if (bindingRef.current) {
+      bindingRef.current.destroy()
+      bindingRef.current = null
+    }
+
+    const editor = editorRef.current
+    const model = editor.getModel()
+
+    if (model) {
+      // Set Monaco syntax highlighting
+      const lang = activeNode ? detectLanguage(activeNode.name) : 'plaintext'
+      // Use monaco global if available or dynamic import
+      const monacoGlobal = (window as any).monaco
+      if (monacoGlobal && monacoGlobal.editor) {
+        monacoGlobal.editor.setModelLanguage(model, lang)
+      }
+
+      const binding = new MonacoBinding(
+        yText,
+        model,
+        new Set([editor]),
+        provider.awareness
+      )
+      bindingRef.current = binding
+    }
+
+    return () => {
+      if (bindingRef.current) {
+        bindingRef.current.destroy()
+        bindingRef.current = null
+      }
+    }
+  }, [doc, provider, monacoReady, activeFileId, nodes])
+
+  // File tree operations
+  const handleSelectFile = (fileId: string) => {
+    if (!openFileIds.includes(fileId)) {
+      setOpenFileIds((prev) => [...prev, fileId])
+    }
+    setActiveFileId(fileId)
+  }
+
+  const handleCloseTab = (fileId: string) => {
+    const nextTabs = openFileIds.filter((id) => id !== fileId)
+    setOpenFileIds(nextTabs)
+    if (activeFileId === fileId && nextTabs.length > 0) {
+      setActiveFileId(nextTabs[nextTabs.length - 1])
+    }
+  }
+
+  const handleCreateNode = (name: string, type: 'file' | 'folder', parentId: string | null) => {
+    if (!doc) return
+    const id = `file-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`
+    const newNode: WorkspaceNode = {
+      id,
+      name,
+      type,
+      parentId,
+      createdAt: Date.now(),
+    }
+    const wsMap = getWorkspaceMap(doc)
+    doc.transact(() => {
+      wsMap.set(id, newNode)
+      if (type === 'file') {
+        const text = doc.getText(`file:${id}`)
+        text.insert(0, `// ${name}\n`)
+      }
+    })
+    if (type === 'file') {
+      handleSelectFile(id)
+    }
+  }
+
+  const handleDeleteNode = (nodeId: string) => {
+    if (!doc) return
+    const wsMap = getWorkspaceMap(doc)
+    doc.transact(() => {
+      wsMap.delete(nodeId)
+    })
+    handleCloseTab(nodeId)
+  }
+
+  const handleRenameNode = (nodeId: string, newName: string) => {
+    if (!doc) return
+    const wsMap = getWorkspaceMap(doc)
+    const existing = wsMap.get(nodeId)
+    if (existing) {
+      wsMap.set(nodeId, { ...existing, name: newName })
+    }
+  }
+
+  const accentColor = doc ? colorFromClientId(doc.clientID * (side === 'left' ? 1 : 3)) : '#6ee7b7'
   const isChaosOffline = chaos.active && status === 'disconnected'
 
   return (
@@ -81,7 +221,6 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
               #{doc.clientID}
             </code>
           )}
-          {/* Diverged char counter in the header too (visible without scrolling) */}
           {isChaosOffline && chaos.divergedChars > 0 && (
             <span className="pane-diverge-pill">
               {chaos.divergedChars} unseen edit{chaos.divergedChars !== 1 ? 's' : ''}
@@ -98,41 +237,63 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
         />
       </div>
 
-      {/* ── Body ────────────────────────────────────────────────────────── */}
-      <div className="pane-body">
-        <div className="editor-wrapper">
-          {doc ? (
-            <MonacoEditor
-              height="100%"
-              defaultLanguage="javascript"
-              theme="vs-dark"
-              options={{
-                fontSize: 14,
-                fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-                fontLigatures: true,
-                minimap: { enabled: false },
-                scrollBeyondLastLine: false,
-                lineNumbers: 'on',
-                renderLineHighlight: 'gutter',
-                cursorBlinking: 'smooth',
-                cursorSmoothCaretAnimation: 'on',
-                smoothScrolling: true,
-                padding: { top: 16, bottom: 16 },
-                wordWrap: 'on',
-              }}
-              onMount={handleEditorMount}
-            />
-          ) : (
-            <div className="editor-loading">Initialising CRDT…</div>
-          )}
-          <CursorOverlay
-            editor={editorRef.current}
-            remoteStates={remoteStates}
-            mergeFlashRange={mergeFlashRange}
-            onFlashComplete={clearMergeFlash}
+      {/* ── Body (File Explorer + TabBar + Monaco + VectorClock) ─────────── */}
+      <div className="pane-body" style={{ display: 'flex', flexDirection: 'row', overflow: 'hidden' }}>
+        {/* Collaborative File Explorer */}
+        <FileExplorer
+          nodes={nodes}
+          activeFileId={activeFileId}
+          onSelectFile={handleSelectFile}
+          onCreateNode={handleCreateNode}
+          onDeleteNode={handleDeleteNode}
+          onRenameNode={handleRenameNode}
+        />
+
+        {/* Center: Tabs + Monaco Editor */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
+          <EditorTabBar
+            nodes={nodes}
+            openFileIds={openFileIds}
+            activeFileId={activeFileId}
+            onSelectTab={setActiveFileId}
+            onCloseTab={handleCloseTab}
           />
+
+          <div className="editor-wrapper" style={{ flex: 1, position: 'relative' }}>
+            {doc ? (
+              <MonacoEditor
+                height="100%"
+                defaultLanguage="typescript"
+                theme="vs-dark"
+                options={{
+                  fontSize: 13,
+                  fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+                  fontLigatures: true,
+                  minimap: { enabled: false },
+                  scrollBeyondLastLine: false,
+                  lineNumbers: 'on',
+                  renderLineHighlight: 'gutter',
+                  cursorBlinking: 'smooth',
+                  cursorSmoothCaretAnimation: 'on',
+                  smoothScrolling: true,
+                  padding: { top: 12, bottom: 12 },
+                  wordWrap: 'on',
+                }}
+                onMount={handleEditorMount}
+              />
+            ) : (
+              <div className="editor-loading">Initialising CRDT…</div>
+            )}
+            <CursorOverlay
+              editor={editorRef.current}
+              remoteStates={remoteStates}
+              mergeFlashRange={mergeFlashRange}
+              onFlashComplete={clearMergeFlash}
+            />
+          </div>
         </div>
 
+        {/* Right Sidebar: Vector Clock & Payload Telemetry */}
         <VectorClockSidebar
           entries={vcEntries}
           localClientId={doc?.clientID ?? null}

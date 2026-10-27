@@ -11,32 +11,34 @@ import { dbPool } from './db.js'
 import { generateHLC } from './hlc.js'
 
 // ── y-websocket wire protocol constants ───────────────────────────────────────
-// Must match what y-websocket client expects:
-// https://github.com/yjs/y-websocket/blob/master/src/y-websocket.js
 const MESSAGE_SYNC = 0
 const MESSAGE_AWARENESS = 1
 
+// Maximum binary frame size (10MB) to mitigate memory exhaustion DoS
+const MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
+
 // ── Room state ─────────────────────────────────────────────────────────────────
-interface Room {
+export interface Room {
   name: string
   doc: Y.Doc
   awareness: awarenessProtocol.Awareness
-  /** Map from clientID → WebSocket for correct awareness cleanup on disconnect */
-  clients: Map<number, WebSocket>
+  /** Set of actively connected WebSockets */
+  clients: Set<WebSocket>
+  /** Map each WebSocket to the awareness clientIDs it registered */
+  clientAwareness: Map<WebSocket, Set<number>>
 }
 
 // Global room registry
 const rooms = new Map<string, Room>()
 
-function getRoom(name: string): Room {
+export function getRoom(name: string): Room {
   return map.setIfUndefined(rooms, name, (): Room => {
     const doc = new Y.Doc()
     const awareness = new awarenessProtocol.Awareness(doc)
+    const clients = new Set<WebSocket>()
+    const clientAwareness = new Map<WebSocket, Set<number>>()
 
-    // Awareness broadcast: fired by applyAwarenessUpdate below.
-    // We broadcast to ALL connected clients (sender included — idempotent for Yjs awareness).
-    // This is the ONLY place awareness gets broadcast; the message handler does NOT
-    // do a second broadcast, avoiding the double-send bug.
+    // Awareness broadcast: triggered whenever local or remote awareness updates
     awareness.on(
       'update',
       ({
@@ -58,31 +60,31 @@ function getRoom(name: string): Room {
           awarenessProtocol.encodeAwarenessUpdate(awareness, changedClients)
         )
         const buf = encoding.toUint8Array(encoder)
-        room.clients.forEach((clientWs) => {
-          if (clientWs.readyState === WebSocket.OPEN) clientWs.send(buf)
-        })
+        for (const clientWs of room.clients) {
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(buf)
+          }
+        }
       }
     )
 
-    const room: Room = { name, doc, awareness, clients: new Map() }
+    const room: Room = { name, doc, awareness, clients, clientAwareness }
     rooms.set(name, room)
 
-    // Store operations in PostgreSQL append-only backend
+    // Store operations in PostgreSQL append-only backend with HLC
     doc.on('update', (updateBuffer: Uint8Array, origin: any) => {
-      // Create a deterministic monotonic timestamp
       const hlc = generateHLC('server')
-      // Extract client ID (we could map properly, but we'll store string)
-      // origin here is commonly the WebSocket connection or client ID. 
-      // We will simply capture 'server-sync' or doc.clientID when unknown
-      const clientId = origin && typeof origin === 'object' && origin.clientID !== undefined 
-        ? origin.clientID.toString() 
+      const clientId = origin && typeof origin === 'object' && origin.clientID !== undefined
+        ? origin.clientID.toString()
         : doc.clientID.toString()
 
-      // Fire and forget storing to PG
       dbPool.query(
         `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES ($1, $2, $3, $4)`,
         [name, clientId, hlc, Buffer.from(updateBuffer)]
-      ).catch(err => console.error('[postgres] update insert error:', err))
+      ).catch(err => {
+        // Log error without crashing
+        console.error(`[postgres] update insert error for doc "${name}":`, err.message)
+      })
     })
 
     // Restore persisted state from LevelDB before serving any clients
@@ -97,18 +99,25 @@ function getRoom(name: string): Room {
   })
 }
 
-// ── Broadcast helper (excludes one WebSocket) ─────────────────────────────────
+// ── Broadcast helper (excludes sender WebSocket) ──────────────────────────────
 function broadcastExcept(room: Room, data: Uint8Array, exclude: WebSocket) {
-  room.clients.forEach((clientWs) => {
+  for (const clientWs of room.clients) {
     if (clientWs !== exclude && clientWs.readyState === WebSocket.OPEN) {
       clientWs.send(data)
     }
-  })
+  }
 }
 
 // ── Per-message handler ────────────────────────────────────────────────────────
 function handleMessage(ws: WebSocket, room: Room, data: RawData) {
   const buf = data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer)
+  
+  if (buf.length > MAX_PAYLOAD_BYTES) {
+    console.warn(`[room] Rejected oversized frame (${buf.length} bytes)`)
+    ws.close(1009, 'Message exceeds size limit')
+    return
+  }
+
   const decoder = decoding.createDecoder(new Uint8Array(buf))
   const encoder = encoding.createEncoder()
   const msgType = decoding.readVarUint(decoder)
@@ -116,9 +125,6 @@ function handleMessage(ws: WebSocket, room: Room, data: RawData) {
   switch (msgType) {
     case MESSAGE_SYNC: {
       encoding.writeVarUint(encoder, MESSAGE_SYNC)
-      // readSyncMessage:
-      //   • If step1 → writes step2 (our doc update) into encoder → we reply to sender
-      //   • If step2 or update → applies to doc, writes nothing → we broadcast raw buf
       const syncMsgType = syncProtocol.readSyncMessage(decoder, encoder, room.doc, null)
 
       // Reply only when encoder has content beyond the outer MESSAGE_SYNC byte
@@ -126,8 +132,7 @@ function handleMessage(ws: WebSocket, room: Room, data: RawData) {
         ws.send(encoding.toUint8Array(encoder))
       }
 
-      // Forward update to all other peers. Persistence is handled inside
-      // getPersistence().bindState() via the doc 'update' listener it installs.
+      // Forward update to all other peers
       if (
         syncMsgType === syncProtocol.messageYjsSyncStep2 ||
         syncMsgType === syncProtocol.messageYjsUpdate
@@ -139,8 +144,26 @@ function handleMessage(ws: WebSocket, room: Room, data: RawData) {
 
     case MESSAGE_AWARENESS: {
       const update = decoding.readVarUint8Array(decoder)
-      // applyAwarenessUpdate triggers the 'update' listener above which broadcasts
-      // to ALL clients. No separate broadcast needed here.
+      
+      // Track which clientIDs belong to this WebSocket for accurate disconnect cleanup
+      try {
+        const idDecoder = decoding.createDecoder(update)
+        const count = decoding.readVarUint(idDecoder)
+        let tracked = room.clientAwareness.get(ws)
+        if (!tracked) {
+          tracked = new Set<number>()
+          room.clientAwareness.set(ws, tracked)
+        }
+        for (let i = 0; i < count; i++) {
+          const clientId = decoding.readVarUint(idDecoder)
+          decoding.readVarUint(idDecoder) // clock
+          decoding.readVarString(idDecoder) // json state
+          tracked.add(clientId)
+        }
+      } catch (e) {
+        // Non-fatal if parsing tracking IDs fails; awareness protocol will still validate
+      }
+
       awarenessProtocol.applyAwarenessUpdate(room.awareness, update, ws)
       break
     }
@@ -158,11 +181,8 @@ export function setupWSConnection(
 ): void {
   const room = getRoom(roomName)
 
-  // Each connection gets its own Yjs clientID so awareness cleanup is precise.
-  // We assign it on first awareness setLocalState from the client; for cleanup
-  // we track the clientID via a WeakMap keyed by ws.
-  const connectionClientId = room.doc.clientID // server-side placeholder; client sends its own
-  room.clients.set(connectionClientId, ws)
+  // Register this socket in the room's active client set
+  room.clients.add(ws)
 
   ws.on('message', (data) => {
     try {
@@ -173,15 +193,18 @@ export function setupWSConnection(
   })
 
   ws.on('close', () => {
-    // Remove this connection from the room's client map
-    room.clients.delete(connectionClientId)
+    room.clients.delete(ws)
 
-    // Clean up awareness state for this peer
-    awarenessProtocol.removeAwarenessStates(
-      room.awareness,
-      [connectionClientId],
-      'client disconnected'
-    )
+    // Clean up awareness state for any clientIDs registered by this connection
+    const controlledIds = room.clientAwareness.get(ws)
+    if (controlledIds && controlledIds.size > 0) {
+      awarenessProtocol.removeAwarenessStates(
+        room.awareness,
+        Array.from(controlledIds),
+        'client disconnected'
+      )
+    }
+    room.clientAwareness.delete(ws)
 
     if (room.clients.size === 0) {
       console.log(`[room] "${roomName}" is now empty`)

@@ -3,3 +3,5 @@ packages:
 allowBuilds:
   esbuild: true
   leveldown: true
+  sharp: set this to true or false
+  unrs-resolver: set this to true or false
