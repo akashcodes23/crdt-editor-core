@@ -4,7 +4,8 @@
   "scripts": {
     "dev": "concurrently \"pnpm --filter server dev\" \"pnpm --filter client dev\"",
     "build": "pnpm --filter server build && pnpm --filter client build",
-    "typecheck": "pnpm --filter server typecheck && pnpm --filter client typecheck"
+    "typecheck": "pnpm --filter server typecheck && pnpm --filter client typecheck",
+    "benchmark": "pnpm --filter server benchmark"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

@@ -1,6 +1,6 @@
-# ⚡ CRDT Editor Core
+# ⚡ Converge
 
-> **A local-first, offline-resilient collaborative code editor powered by Conflict-free Replicated Data Types (CRDTs), Hybrid Logical Clocks (HLC), and Monaco.**
+> **A local-first collaborative development environment exploring conflict-free replicated data types (CRDTs), fault-tolerant synchronization, durable operation history, time-travel debugging, and distributed-systems observability.**
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![Next.js](https://img.shields.io/badge/Next.js-15-black.svg)](https://nextjs.org/)
@@ -13,12 +13,13 @@
 
 ## 🌟 Overview
 
-**`crdt-editor-core`** is an industry-grade collaborative code editor designed to tackle real distributed systems challenges:
-- **Strong Eventual Consistency (SEC)**: Guarantees that all concurrent edits across disconnected peers converge deterministically to the identical state without centralized lock management.
-- **Delta-State Synchronization**: Reduces network synchronization payload by up to **92%** compared to naive state broadcast by exchanging binary State Vectors and incremental update diffs.
-- **Hybrid Logical Clocks (HLC)**: Implements strictly monotonic, lexically sortable Lamport clocks for deterministic distributed event ordering.
-- **Deterministic Time-Travel History**: Point-in-time document reconstruction by replaying append-only binary operations stored in PostgreSQL.
-- **Network Partition & Chaos Simulation**: Built-in 30s split-brain testing mechanism with real-time diverged character tracking and linear diff merge-flash animations.
+**Converge** is an industry-grade collaborative development platform designed to tackle real distributed systems challenges:
+- **Strong Eventual Consistency (SEC)**: Guarantees that concurrent edits across disconnected peers converge deterministically to the identical state without centralized lock contention.
+- **Differential State Synchronization**: Empirically measured to reduce wire payloads by **97.28% to 99.94%** relative to naive full-state broadcasts by exchanging binary State Vectors and incremental update diffs.
+- **Hybrid Logical Clocks (HLC)**: Implements strictly monotonic, lexically sortable Lamport clocks preserving causal ordering across NTP clock skews.
+- **Hierarchical CRDT Workspace**: Cycle-safe collaborative file and folder explorer with immutable UUID document identity, preventing orphan islands under concurrent moves.
+- **Deterministic Time-Travel History**: Point-in-time document reconstruction by replaying append-only binary operations stored in PostgreSQL stamped with HLC timestamps.
+- **Network Partition & Chaos Simulation**: Built-in split-brain testing mechanism with real-time diverged character tracking and linear diff merge-flash animations.
 
 ---
 
@@ -49,56 +50,43 @@
 
 ## 🚀 Key Features
 
-### 1. Dual-Tier Persistence
-* **PostgreSQL (Audit & Time-Travel)**: Stores every atomic binary operation as BYTEA stamped with a Hybrid Logical Clock (`<time36>-<counter36>-<nodeId>`).
-* **LevelDB (Hot Room Recovery)**: Embedded in-process key-value store using `y-leveldb` for sub-10ms state restoration when WebSocket rooms are initialized.
-* **IndexedDB (Browser Offline-First)**: Persists document state locally in the user's browser, enabling full offline editing with transparent synchronization on reconnect.
+### 1. Multi-File Collaborative Workspace
+* **Hierarchical File Tree**: Full folder and file lifecycle (creation, deletion, in-place renaming, folder reparenting).
+* **Cycle Prevention**: Topological sanitizer breaks cyclic parent loops to root if peers execute simultaneous cross-moves.
+* **Dynamic Monaco Models**: Switching tabs switches Monaco text models and language modes (`typescript`, `javascript`, `python`, `json`, `markdown`) without resetting undo history or cursor position.
 
-### 2. Time-Travel History Scrubbing
-* Scrub through the timeline of any document via the interactive history pane.
-* Reconstructs historical document snapshots by replaying binary updates sequentially up to the selected HLC timestamp.
-* Character-level attribution color-codes each text block according to the author client ID.
+### 2. Dual-Tier Persistence & Fast Recovery
+* **PostgreSQL (Audit & Time-Travel)**: Stores every atomic binary operation as `BYTEA` stamped with a Hybrid Logical Clock (`<time36>-<counter36>-<nodeId>`).
+* **LevelDB (Hot Room Recovery)**: Embedded in-process key-value store using `y-leveldb` for rapid state restoration on room initialization.
+* **Snapshot Compaction**: Folds historical operation streams into compacted binary snapshots, reducing cold recovery latency by **9.09x** (0.21 ms vs 1.95 ms).
+* **IndexedDB (Browser Offline-First)**: Persists document state locally in the user's browser, enabling offline editing with automatic reconciliation on reconnect.
 
-### 3. Distributed Chaos & Telemetry
+### 3. Distributed Chaos Lab & Telemetry
 * **Chaos Mode**: Simulates sudden network partitions with a 30-second countdown.
 * **Telemetry HUD**: Live inspection of Lamport Vector Clocks and byte-level comparison of delta sync vs full state reload.
 * **Merge Flash**: Visual highlight highlighting reconciled ranges when disconnected peers merge back into the swarm.
 
-### 4. Formally Verified Convergence
-* Automated Jest test suite testing CRDT edge cases:
-  * Concurrent inserts at identical positions
-  * Concurrent duplicate character deletes
-  * Simultaneous insert and delete conflicts
-  * Offline duplicate text generation
-  * Rapid interleaved operations (100+ concurrent ops)
-
 ---
 
-## 📦 Project Structure
+## 📊 Measured Performance Benchmarks
 
-```
-crdt-editor-core/
-├── docker-compose.yml           # PostgreSQL 15 container for operation logging
-├── package.json                 # Monorepo root workspace configuration
-├── pnpm-workspace.yaml
-└── packages/
-    ├── server/                  # WebSocket & Persistence Server
-    │   ├── src/
-    │   │   ├── hlc.ts           # Hybrid Logical Clock generator
-    │   │   ├── db.ts            # PostgreSQL pool and schema migrations
-    │   │   ├── room.ts          # Custom y-websocket wire protocol handler
-    │   │   ├── persistence.ts   # LevelDB persistence binding
-    │   │   ├── index.ts         # Express HTTP & WebSocket entrypoint
-    │   │   └── __tests__/       # CRDT convergence test suite
-    │   └── package.json
-    └── client/                  # Next.js App Router & Monaco Editor
-        ├── src/
-        │   ├── app/             # Next.js pages and global styling
-        │   ├── components/      # SplitScreen, EditorPane, HistoryPane, Overlay
-        │   ├── hooks/           # useYDoc, useAwareness, useVectorClock
-        │   └── lib/             # Yjs helpers and color mappings
-        └── package.json
-```
+All metrics represent real measurements executed on Apple Silicon (`darwin arm64`, Node.js `v22.23.1`). Full methodology and percentile distributions documented in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+### 1. Wire Payload Reduction (Full vs. Differential Sync)
+| Workload | Document Size | Full State Payload | Differential Diff | Measured Payload Reduction |
+| :--- | :--- | :--- | :--- | :--- |
+| **Small Document (~25 lines)** | 1,672 characters | 1,690 bytes | 46 bytes | **97.28%** |
+| **Medium Document (~250 lines)** | 17,197 characters | 17,216 bytes | 48 bytes | **99.72%** |
+| **Large Document (~1,200 lines)** | 84,297 characters | 84,316 bytes | 48 bytes | **99.94%** |
+
+### 2. Micro-Operation Latency & Database Performance
+| Metric | Measured Result |
+| :--- | :--- |
+| **In-Memory Sync Latency (Mean)** | **15.12 µs** (P50: 12.17 µs, P99: 124.79 µs) |
+| **Cold Recovery Speedup (Snapshot vs Replay)** | **9.09x faster** (0.21 ms vs 1.95 ms) |
+| **Storage Compaction Ratio** | **75.62% reduction** (7,456 bytes $\to$ 1,818 bytes) |
+| **PostgreSQL Single-Row Write Latency** | **0.30 ms** (P50: 0.21 ms, P95: 0.55 ms) |
+| **50-Replica Swarm Convergence** | **8.04 ms** across 50 distributed peer nodes |
 
 ---
 
@@ -107,7 +95,7 @@ crdt-editor-core/
 ### Prerequisites
 * **Node.js** >= 18
 * **pnpm** >= 8
-* **Docker** (for PostgreSQL)
+* **Docker** or native **PostgreSQL 15**
 
 ### 1. Clone & Install
 ```bash
@@ -126,33 +114,51 @@ docker compose up -d
 pnpm dev
 ```
 * **Frontend**: [http://localhost:3000](http://localhost:3000)
-* **WebSocket Server**: `ws://localhost:1234`
-* **HTTP Server**: `http://localhost:1234`
+* **WebSocket / HTTP Server**: `http://localhost:1234` (`ws://localhost:1234`)
 
 ### 4. Run Convergence Tests
 ```bash
-pnpm --filter server test
+pnpm test
+```
+
+### 5. Run Performance Benchmarks
+```bash
+pnpm benchmark
 ```
 
 ---
 
-## 🧪 Testing Convergence
+## 🧪 Testing Standard
 
-Run the formal verification test suite:
+Run the formal verification suite (18 unit & integration tests):
 
 ```bash
 pnpm --filter server test
 ```
 
 ```
+PASS src/__tests__/hlc-and-recovery.test.ts
+PASS src/__tests__/distributed-correctness.test.ts
+PASS src/__tests__/workspace-invariants.test.ts
 PASS src/__tests__/crdt-convergence.test.ts
-  CRDT Convergence Tests
-    ✓ Test 1: Concurrent inserts at same position (4 ms)
-    ✓ Test 2: Concurrent deletes of same character (1 ms)
-    ✓ Test 3: Insert on A while B deletes at same position (1 ms)
-    ✓ Test 4: Both clients type identical text offline (1 ms)
-    ✓ Test 5: Rapid sequential edits (100 ops, then sync) (6 ms)
+
+Test Suites: 4 passed, 4 total
+Tests:       18 passed, 18 total
+Snapshots:   0 total
+Time:        0.804 s
 ```
+
+---
+
+## 📚 Technical Documentation
+
+* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): Distributed systems design, wire protocols, and recovery pipeline.
+* [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md): Reproducible performance measurements, methodology, and hardware specification.
+* [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md): CRDT workspace tree representation, cycle-breaking invariants, and concurrency policies.
+* [`docs/ENGINEERING_ROADMAP.md`](docs/ENGINEERING_ROADMAP.md): Technical roadmap across all phases.
+* [`docs/TESTING_STRATEGY.md`](docs/TESTING_STRATEGY.md): Invariant specifications and verification criteria.
+* [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md): Candid technical debt and architectural trade-offs.
+* [`SECURITY.md`](SECURITY.md): Threat model, security boundaries, and disclosure policy.
 
 ---
 
