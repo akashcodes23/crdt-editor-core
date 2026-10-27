@@ -8,6 +8,11 @@ export interface WorkspaceNode {
   createdAt: number
 }
 
+export interface TreeNode extends WorkspaceNode {
+  children: TreeNode[]
+  depth: number
+}
+
 export const WORKSPACE_FILES_KEY = 'workspace:files'
 
 /**
@@ -47,10 +52,105 @@ export function isDescendant(
 }
 
 /**
+ * Resolves effective parent-child relationships deterministically.
+ * If any node's ancestor path contains a cycle due to concurrent moves across peers,
+ * the edge that creates the cycle is deterministically broken by resetting that
+ * node's parentId to null (root), preventing disconnected islands.
+ */
+export function sanitizeTreeHierarchy(nodes: WorkspaceNode[]): WorkspaceNode[] {
+  const nodeMap = new Map<string, WorkspaceNode>(nodes.map((n) => [n.id, { ...n }]))
+
+  for (const node of nodeMap.values()) {
+    if (!node.parentId) continue
+
+    // Trace ancestors
+    const visited = new Set<string>([node.id])
+    let curr = nodeMap.get(node.parentId)
+    let hasCycle = false
+
+    while (curr) {
+      if (visited.has(curr.id)) {
+        hasCycle = true
+        break
+      }
+      visited.add(curr.id)
+      curr = curr.parentId ? nodeMap.get(curr.parentId) : undefined
+    }
+
+    if (hasCycle) {
+      // Deterministic conflict resolution: break cyclic link to root
+      node.parentId = null
+    }
+  }
+
+  return Array.from(nodeMap.values())
+}
+
+/**
+ * Builds a hierarchical tree structure from flat node records.
+ */
+export function buildHierarchyTree(nodes: WorkspaceNode[]): TreeNode[] {
+  const sanitized = sanitizeTreeHierarchy(nodes)
+  const nodeMap = new Map<string, TreeNode>()
+
+  // Sort nodes: folders first, then by name
+  const sorted = [...sanitized].sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'folder' ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
+
+  for (const node of sorted) {
+    nodeMap.set(node.id, { ...node, children: [], depth: 0 })
+  }
+
+  const roots: TreeNode[] = []
+
+  for (const node of sorted) {
+    const treeNode = nodeMap.get(node.id)!
+    if (node.parentId && nodeMap.has(node.parentId)) {
+      const parent = nodeMap.get(node.parentId)!
+      treeNode.depth = parent.depth + 1
+      parent.children.push(treeNode)
+    } else {
+      roots.push(treeNode)
+    }
+  }
+
+  return roots
+}
+
+/**
  * Get or initialize the shared Y.Map containing the workspace file tree.
  */
 export function getWorkspaceMap(doc: Y.Doc): Y.Map<WorkspaceNode> {
   return doc.getMap<WorkspaceNode>(WORKSPACE_FILES_KEY)
+}
+
+/**
+ * Move a node into a new parent folder, validating against local cycles.
+ */
+export function moveNode(
+  doc: Y.Doc,
+  nodeId: string,
+  newParentId: string | null
+): boolean {
+  const map = getWorkspaceMap(doc)
+  const node = map.get(nodeId)
+  if (!node) return false
+  if (nodeId === newParentId) return false
+
+  if (newParentId) {
+    const allNodes = new Map<string, WorkspaceNode>()
+    map.forEach((n) => allNodes.set(n.id, n))
+    if (isDescendant(allNodes, newParentId, nodeId)) {
+      return false // Cannot move into own descendant
+    }
+  }
+
+  doc.transact(() => {
+    map.set(nodeId, { ...node, parentId: newParentId })
+  })
+  return true
 }
 
 /**
@@ -61,13 +161,23 @@ export function initializeStarterWorkspace(doc: Y.Doc): void {
   if (map.size > 0) return
 
   doc.transact(() => {
-    // 1. main entrypoint
+    // 1. src folder
+    const srcFolder: WorkspaceNode = {
+      id: 'folder-src',
+      name: 'src',
+      type: 'folder',
+      parentId: null,
+      createdAt: Date.now(),
+    }
+    map.set(srcFolder.id, srcFolder)
+
+    // 2. index.ts inside src
     const indexNode: WorkspaceNode = {
       id: 'file-index-ts',
       name: 'index.ts',
       type: 'file',
-      parentId: null,
-      createdAt: Date.now(),
+      parentId: 'folder-src',
+      createdAt: Date.now() + 1,
     }
     map.set(indexNode.id, indexNode)
 
@@ -75,7 +185,7 @@ export function initializeStarterWorkspace(doc: Y.Doc): void {
     if (indexText.length === 0) {
       indexText.insert(
         0,
-        `// Converge Collaborative IDE
+        `// Converge Multi-File Collaborative IDE
 import { VectorClock } from './vectorClock'
 
 function main() {
@@ -89,13 +199,13 @@ main()
       )
     }
 
-    // 2. vector clock helper
+    // 3. vectorClock.ts inside src
     const vcNode: WorkspaceNode = {
       id: 'file-vector-clock-ts',
       name: 'vectorClock.ts',
       type: 'file',
-      parentId: null,
-      createdAt: Date.now() + 1,
+      parentId: 'folder-src',
+      createdAt: Date.now() + 2,
     }
     map.set(vcNode.id, vcNode)
 
@@ -123,13 +233,13 @@ main()
       )
     }
 
-    // 3. docs markdown file
+    // 4. README.md in root
     const docNode: WorkspaceNode = {
       id: 'file-readme-md',
       name: 'README.md',
       type: 'file',
       parentId: null,
-      createdAt: Date.now() + 2,
+      createdAt: Date.now() + 3,
     }
     map.set(docNode.id, docNode)
 
@@ -137,11 +247,12 @@ main()
     if (docText.length === 0) {
       docText.insert(
         0,
-        `# Converge Workspace
+        `# Converge Collaborative Workspace
 
-This workspace demonstrates multi-file collaborative editing via sequence CRDTs.
-- Edits in any file are synchronized independently across connected peers.
-- Switch tabs or create new files in the explorer sidebar.
+This workspace demonstrates multi-file collaborative editing via sequence CRDTs:
+- Folders and files possess immutable UUIDs independent of mutable paths.
+- Edits in any file synchronize independently without blocking sibling documents.
+- Cycles caused by concurrent folder moves are deterministically resolved to root.
 `
       )
     }

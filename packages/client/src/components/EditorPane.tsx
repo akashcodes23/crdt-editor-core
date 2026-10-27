@@ -18,6 +18,7 @@ import {
   getWorkspaceMap,
   initializeStarterWorkspace,
   detectLanguage,
+  moveNode,
 } from '@/lib/workspace'
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), {
@@ -206,6 +207,11 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
     }
   }
 
+  const handleMoveNode = (nodeId: string, newParentId: string | null) => {
+    if (!doc) return
+    moveNode(doc, nodeId, newParentId)
+  }
+
   const accentColor = doc ? colorFromClientId(doc.clientID * (side === 'left' ? 1 : 3)) : '#6ee7b7'
   const isChaosOffline = chaos.active && status === 'disconnected'
 
@@ -247,6 +253,7 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
           onCreateNode={handleCreateNode}
           onDeleteNode={handleDeleteNode}
           onRenameNode={handleRenameNode}
+          onMoveNode={handleMoveNode}
         />
 
         {/* Center: Tabs + Monaco Editor */}
