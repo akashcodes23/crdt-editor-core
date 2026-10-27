@@ -75,13 +75,22 @@ export class HybridLogicalClock {
    * Parse an HLC string back to its components.
    */
   public static parse(hlcString: string): HLCTimestamp {
+    if (!hlcString || typeof hlcString !== 'string') {
+      throw new Error(`Malformed HLC string: "${hlcString}"`)
+    }
     const parts = hlcString.split('-')
     if (parts.length < 3) {
       throw new Error(`Malformed HLC string: "${hlcString}"`)
     }
     const wallTime = parseInt(parts[0], 36)
     const counter = parseInt(parts[1], 36)
+    if (isNaN(wallTime) || isNaN(counter)) {
+      throw new Error(`Malformed HLC numeric component: "${hlcString}"`)
+    }
     const nodeId = parts.slice(2).join('-')
+    if (!nodeId) {
+      throw new Error(`Malformed HLC nodeId: "${hlcString}"`)
+    }
 
     return { wallTime, counter, nodeId }
   }

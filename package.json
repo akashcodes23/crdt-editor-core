@@ -5,6 +5,7 @@
     "dev": "concurrently \"pnpm --filter server dev\" \"pnpm --filter client dev\"",
     "build": "pnpm --filter server build && pnpm --filter client build",
     "typecheck": "pnpm --filter server typecheck && pnpm --filter client typecheck",
+    "test": "pnpm --filter server test",
     "benchmark": "pnpm --filter server benchmark"
   },
   "devDependencies": {

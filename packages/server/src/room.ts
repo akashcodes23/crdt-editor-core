@@ -36,6 +36,12 @@ export interface Room {
   clientAwareness: Map<ExtendedWebSocket, Set<number>>
   /** Promise that resolves when persistence state is loaded */
   loadedPromise: Promise<void>
+  /** Promise chain of queued PostgreSQL persistence writes */
+  persistenceQueue: Promise<void>
+  /** Highest HLC confirmed written to PostgreSQL for this room */
+  lastPersistedHlc: string | null
+  /** Mutex flag to serialize compaction requests */
+  isCompacting?: boolean
 }
 
 // Global room registry
@@ -79,6 +85,9 @@ export function getRoom(name: string): Room {
     )
 
     // Store operations in PostgreSQL append-only backend with HLC
+    let persistenceQueue = Promise.resolve()
+    let lastPersistedHlc: string | null = null
+
     doc.on('update', (updateBuffer: Uint8Array, origin: any) => {
       // Do not store updates generated during initial LevelDB recovery
       if (origin === 'leveldb-restore') return
@@ -89,14 +98,25 @@ export function getRoom(name: string): Room {
           ? origin.clientID.toString()
           : doc.clientID.toString()
 
-      dbPool
+      const writeOp = dbPool
         .query(
           `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES ($1, $2, $3, $4)`,
           [name, clientId, hlc, Buffer.from(updateBuffer)]
         )
+        .then(() => {
+          const r = rooms.get(name)
+          if (r) {
+            r.lastPersistedHlc = hlc
+          }
+        })
         .catch((err) => {
           console.error(`[postgres] update insert error for doc "${name}":`, err.message)
         })
+
+      const r = rooms.get(name)
+      if (r) {
+        r.persistenceQueue = r.persistenceQueue.then(() => writeOp)
+      }
     })
 
     // Restore persisted state from LevelDB before serving any clients
@@ -109,10 +129,29 @@ export function getRoom(name: string): Room {
         console.warn(`[room] "${name}" LevelDB bind error:`, err)
       })
 
-    const room: Room = { name, doc, awareness, clients, clientAwareness, loadedPromise }
+    const room: Room = {
+      name,
+      doc,
+      awareness,
+      clients,
+      clientAwareness,
+      loadedPromise,
+      persistenceQueue,
+      lastPersistedHlc,
+      isCompacting: false,
+    }
     rooms.set(name, room)
     return room
   })
+}
+
+/**
+ * Awaits all pending asynchronous PostgreSQL operation inserts for this room.
+ * Returns the highest persisted HLC timestamp.
+ */
+export async function flushRoomPersistence(room: Room): Promise<string | null> {
+  await room.persistenceQueue
+  return room.lastPersistedHlc
 }
 
 // ── Broadcast helper (excludes sender WebSocket) ──────────────────────────────

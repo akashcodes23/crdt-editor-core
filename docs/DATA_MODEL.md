@@ -72,8 +72,11 @@ If Peer A and Peer B independently create files with identical names (e.g. `conf
 | `distributed-correctness.test.ts` | Hybrid Logical Clock causal chains & NTP regression | **PASS** |
 | `hlc-and-recovery.test.ts` | Strict HLC monotonicity & snapshot tail recovery | **PASS** |
 | `crdt-convergence.test.ts` | Concurrent inserts, deletes, and rapid sequential edits | **PASS** |
+| `hlc-semantics.test.ts` | Clock regression, tie-breaking, causality, and parsing errors | **PASS** |
+| `compaction-races-and-recovery.test.ts` | Concurrent write preservation, compaction mutex, rollback safety, and 410 retention contract | **PASS** |
 
-Total: **18 passing unit & integration tests** across 4 test suites.
+Total: **31 passing unit & integration tests** across 6 test suites.  
+For persistence, compaction, and recovery invariants, see [RECOVERY.md](./RECOVERY.md).
 
 ---
 

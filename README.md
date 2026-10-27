@@ -58,7 +58,7 @@
 ### 2. Dual-Tier Persistence & Fast Recovery
 * **PostgreSQL (Audit & Time-Travel)**: Stores every atomic binary operation as `BYTEA` stamped with a Hybrid Logical Clock (`<time36>-<counter36>-<nodeId>`).
 * **LevelDB (Hot Room Recovery)**: Embedded in-process key-value store using `y-leveldb` for rapid state restoration on room initialization.
-* **Snapshot Compaction**: Folds historical operation streams into compacted binary snapshots, reducing cold recovery latency by **9.09x** (0.21 ms vs 1.95 ms).
+* **Snapshot Compaction**: Folds historical operation streams into compacted binary snapshots, reducing cold recovery latency by **3.75x** (0.20 ms vs 0.76 ms).
 * **IndexedDB (Browser Offline-First)**: Persists document state locally in the user's browser, enabling offline editing with automatic reconciliation on reconnect.
 
 ### 3. Distributed Chaos Lab & Telemetry
@@ -130,22 +130,24 @@ pnpm benchmark
 
 ## 🧪 Testing Standard
 
-Run the formal verification suite (19 unit & integration tests):
+Run the formal verification suite (31 unit & integration tests):
 
 ```bash
 pnpm --filter server test
 ```
 
 ```
-PASS src/__tests__/hlc-and-recovery.test.ts
-PASS src/__tests__/crdt-convergence.test.ts
+PASS src/__tests__/compaction-races-and-recovery.test.ts
+PASS src/__tests__/hlc-semantics.test.ts
 PASS src/__tests__/distributed-correctness.test.ts
 PASS src/__tests__/workspace-invariants.test.ts
+PASS src/__tests__/hlc-and-recovery.test.ts
+PASS src/__tests__/crdt-convergence.test.ts
 
-Test Suites: 4 passed, 4 total
-Tests:       19 passed, 19 total
+Test Suites: 6 passed, 6 total
+Tests:       31 passed, 31 total
 Snapshots:   0 total
-Time:        0.768 s
+Time:        0.633 s
 ```
 
 ---
@@ -153,6 +155,7 @@ Time:        0.768 s
 ## 📚 Technical Documentation
 
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): Distributed systems design, wire protocols, and recovery pipeline.
+* [`docs/RECOVERY.md`](docs/RECOVERY.md): Persistence, compaction, historical replay, and recovery contract.
 * [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md): Reproducible performance measurements, methodology, and hardware specification.
 * [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md): CRDT workspace tree representation, cycle-breaking invariants, and concurrency policies.
 * [`docs/ENGINEERING_ROADMAP.md`](docs/ENGINEERING_ROADMAP.md): Technical roadmap across all phases.
