@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: crdt-postgres
+    environment:
+      POSTGRES_USER: crdt
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: crdthistory
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:

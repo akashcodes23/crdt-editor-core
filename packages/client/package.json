@@ -1,0 +1,30 @@
+{
+  "name": "client",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "^15.1.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "yjs": "^13.6.18",
+    "y-websocket": "1.5.3",
+    "y-indexeddb": "^9.0.12",
+    "y-monaco": "^0.1.6",
+    "y-protocols": "^1.0.6",
+    "lib0": "^0.2.98",
+    "@monaco-editor/react": "^4.6.0",
+    "monaco-editor": "^0.47.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "@types/react": "^19.0.7",
+    "@types/react-dom": "^19.0.3",
+    "typescript": "^5.3.3"
+  }
+}
