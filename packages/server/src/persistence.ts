@@ -57,11 +57,13 @@ export function getPersistence(): Persistence {
       const initialUpdate = Y.encodeStateAsUpdate(ydoc)
       await ldb.storeUpdate(docName, initialUpdate)
 
-      // 3. Merge persisted state into live ydoc — this is the actual restore
-      Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedDoc))
+      // 3. Merge persisted state into live ydoc with origin 'leveldb-restore'
+      // This prevents triggering duplicate database operations during initialization
+      Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(persistedDoc), 'leveldb-restore')
 
       // 4. Subscribe so every future incremental update is persisted immediately
-      ydoc.on('update', (update: Uint8Array) => {
+      ydoc.on('update', (update: Uint8Array, origin: any) => {
+        if (origin === 'leveldb-restore') return
         ldb.storeUpdate(docName, update).catch((err: unknown) => {
           console.error(`[persistence] storeUpdate failed for "${docName}":`, err)
         })

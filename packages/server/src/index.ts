@@ -49,7 +49,7 @@ app.get('/doc/:id/history', async (req, res) => {
 
     // Postgres fetches operations that happened strictly up to `beforeHLC`
     const { rows } = await dbPool.query(
-      `SELECT update_blob FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2 ORDER BY hlc_timestamp ASC`,
+      `SELECT update_blob FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2 ORDER BY hlc_timestamp ASC, id ASC`,
       [docId, beforeHLC]
     )
 
@@ -66,11 +66,12 @@ app.post('/doc/:id/snapshot', async (req, res) => {
   try {
     const docId = req.params.id
     const room = getRoom(docId)
+    await room.loadedPromise
     const snapshot = Y.encodeStateAsUpdate(room.doc)
     
     // Find highest HLC currently stored for this doc
     const hlcRes = await dbPool.query(
-      `SELECT hlc_timestamp FROM operations WHERE doc_id = $1 ORDER BY hlc_timestamp DESC LIMIT 1`,
+      `SELECT hlc_timestamp FROM operations WHERE doc_id = $1 ORDER BY hlc_timestamp DESC, id DESC LIMIT 1`,
       [docId]
     )
     const latestHlc = hlcRes.rows[0]?.hlc_timestamp || '0'
@@ -99,7 +100,9 @@ wss.on('connection', (ws, req) => {
   const roomName = url.pathname.slice(1) || 'default'
 
   console.log(`[ws] client connected → room="${roomName}"`)
-  setupWSConnection(ws, req, roomName)
+  setupWSConnection(ws, req, roomName).catch((err) => {
+    console.error(`[ws] setup connection error for room "${roomName}":`, err)
+  })
 
   ws.on('close', () => {
     console.log(`[ws] client disconnected ← room="${roomName}"`)

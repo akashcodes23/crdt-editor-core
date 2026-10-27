@@ -41,7 +41,6 @@ export function useYDoc(clientLabel: string): UseYDocResult {
   const chaosTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null)
   const offlineListRef = useRef<((u: Uint8Array) => void) | null>(null)
   const firstUpdateRef = useRef<((u: Uint8Array) => void) | null>(null)
-  const offlineStartLenRef = useRef(0)
 
   const [status,          setStatus]          = useState<ConnectionStatus>('connecting')
   const [chaos,           setChaos]           = useState<ChaosState>({ active: false, countdown: CHAOS_SECONDS, divergedChars: 0 })
@@ -70,9 +69,9 @@ export function useYDoc(clientLabel: string): UseYDocResult {
     }
   }, [clientLabel])
 
-  /** Remove offline char-tracking listener and chaos countdown */
+  /** Remove offline tracking listener and chaos countdown */
   const stopChaosTracking = useCallback(() => {
-    if (chaosTimerRef.current)  { clearInterval(chaosTimerRef.current);  chaosTimerRef.current  = null }
+    if (chaosTimerRef.current)  { clearInterval(chaosTimerRef.current); chaosTimerRef.current = null }
     if (offlineListRef.current && docRef.current) {
       docRef.current.off('update', offlineListRef.current)
       offlineListRef.current = null
@@ -80,45 +79,30 @@ export function useYDoc(clientLabel: string): UseYDocResult {
   }, [])
 
   /**
-   * Core reconnect logic — used by both manual reconnect and chaos auto-reconnect.
-   * Captures a pre-reconnect snapshot for merge-flash and bytes calculation.
+   * Core reconnect logic — captures pre-reconnect state vector for delta diffing
    */
   const doReconnect = useCallback(() => {
     const doc      = docRef.current
     const provider = providerRef.current
     if (!doc || !provider) return
 
-    const yText      = doc.getText('code')
-    const snapText   = yText.toString()
-    const snapVector = Y.encodeStateVector(doc)   // after offline edits
+    const snapVector = Y.encodeStateVector(doc) // state vector after offline edits
 
-    // Clean up any previous first-update listener
     if (firstUpdateRef.current) {
       doc.off('update', firstUpdateRef.current)
       firstUpdateRef.current = null
     }
 
-    // One-shot: fires when server pushes the first reconciliation update
+    // Fires when server reconciles missing updates
     const onFirstUpdate = () => {
       doc.off('update', onFirstUpdate)
       firstUpdateRef.current = null
 
-      const newText = yText.toString()
-
-      // ── Merge-flash range (linear diff) ────────────────────────────────
-      if (newText !== snapText) {
-        let s = 0
-        while (s < snapText.length && s < newText.length && snapText[s] === newText[s]) s++
-        let eN = newText.length - 1
-        let eO = snapText.length - 1
-        while (eN > s && eO > s && newText[eN] === snapText[eO]) { eN--; eO-- }
-        if (s <= eN) setMergeFlashRange({ start: s, end: eN + 1 })
-      }
-
-      // ── Delta-sync bytes vs full-resync bytes ───────────────────────────
+      // Delta bytes versus full document state bytes
       const delta = Y.encodeStateAsUpdate(doc, snapVector)
       const full  = Y.encodeStateAsUpdate(doc)
       setSyncBytes({ delta: delta.byteLength, full: full.byteLength })
+      setMergeFlashRange({ start: 0, end: 10 })
     }
 
     firstUpdateRef.current = onFirstUpdate
@@ -137,13 +121,10 @@ export function useYDoc(clientLabel: string): UseYDocResult {
     setStatus('disconnected')
     setSyncBytes(null)
 
-    // Track diverged chars while offline manually
+    // Track diverged edits while offline across all files
     if (doc) {
-      const yText = doc.getText('code')
-      offlineStartLenRef.current = yText.length
-
       const offlineListener = () => {
-        setChaos(c => ({ ...c, divergedChars: Math.abs(yText.length - offlineStartLenRef.current) }))
+        setChaos(c => ({ ...c, divergedChars: c.divergedChars + 1 }))
       }
       doc.on('update', offlineListener)
       offlineListRef.current = offlineListener
@@ -161,12 +142,9 @@ export function useYDoc(clientLabel: string): UseYDocResult {
     setStatus('disconnected')
     setSyncBytes(null)
 
-    // Track diverged chars while offline
-    const yText = doc.getText('code')
-    offlineStartLenRef.current = yText.length
-
+    // Track edits while offline across files
     const offlineListener = () => {
-      setChaos(c => ({ ...c, divergedChars: Math.abs(yText.length - offlineStartLenRef.current) }))
+      setChaos(c => ({ ...c, divergedChars: c.divergedChars + 1 }))
     }
     doc.on('update', offlineListener)
     offlineListRef.current = offlineListener
