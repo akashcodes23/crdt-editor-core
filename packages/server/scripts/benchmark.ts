@@ -180,6 +180,15 @@ async function runBenchmarks() {
     baseText.insert(baseText.length, `item_${i}\n`)
   }
 
+  // ── Warm-up JIT compilation before timing ──
+  for (let w = 0; w < 5; w++) {
+    const warmupDocA = new Y.Doc()
+    for (const op of allOps) Y.applyUpdate(warmupDocA, op)
+    const warmupDocB = new Y.Doc()
+    Y.applyUpdate(warmupDocB, snap300)
+    for (let i = cutoffIndex; i < allOps.length; i++) Y.applyUpdate(warmupDocB, allOps[i])
+  }
+
   // Measure Full Replay (Replaying all 400 ops from scratch)
   for (let t = 0; t < RECOVERY_TRIALS; t++) {
     const t0 = performance.now()
@@ -205,12 +214,12 @@ async function runBenchmarks() {
 
   const fullReplayStats = stats(fullReplayTimes)
   const snapRecoveryStats = stats(snapshotRecoveryTimes)
-  const recoverySpeedup = fullReplayStats.mean / snapRecoveryStats.mean
+  const recoverySpeedup = fullReplayStats.median / snapRecoveryStats.median
 
-  console.log(`Trials per method: ${RECOVERY_TRIALS}`)
+  console.log(`Trials per method: ${RECOVERY_TRIALS} (after 5 warmup cycles)`)
   console.log(`Method A: Full Replay (400 ops): Mean = ${fullReplayStats.mean.toFixed(3)} ms | Median = ${fullReplayStats.median.toFixed(3)} ms | P95 = ${fullReplayStats.p95.toFixed(3)} ms`)
   console.log(`Method B: Snapshot + Tail (100 ops): Mean = ${snapRecoveryStats.mean.toFixed(3)} ms | Median = ${snapRecoveryStats.median.toFixed(3)} ms | P95 = ${snapRecoveryStats.p95.toFixed(3)} ms`)
-  console.log(`Speedup Factor: ${recoverySpeedup.toFixed(2)}x faster restoration`)
+  console.log(`Median Speedup Factor: ${recoverySpeedup.toFixed(2)}x faster restoration`)
 
   // ───────────────────────────────────────────────────────────────────────────
   // Benchmark 5: PostgreSQL Database Persistence Latency

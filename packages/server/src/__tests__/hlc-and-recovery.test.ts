@@ -4,7 +4,7 @@ import { generateHLC } from '../hlc'
 describe('Hybrid Logical Clock & Snapshot Recovery Tests', () => {
   it('Test 1: HLC Monotonicity and Lexical Sortability', () => {
     const timestamps: string[] = []
-    
+
     // Generate rapid timestamps
     for (let i = 0; i < 50; i++) {
       timestamps.push(generateHLC('server1'))
@@ -61,5 +61,61 @@ describe('Hybrid Logical Clock & Snapshot Recovery Tests', () => {
     expect(docA.getText('code').toString()).toBe(expectedFinalText)
     expect(docB.getText('code').toString()).toBe(expectedFinalText)
     expect(docA.getText('code').toString()).toBe(docB.getText('code').toString())
+  })
+
+  it('Test 3: Transactional Log Compaction & Delta Tail Integrity', () => {
+    // Simulates database compaction workflow
+    const liveDoc = new Y.Doc()
+    const yText = liveDoc.getText('code')
+
+    interface StoredOp {
+      id: number
+      hlc: string
+      blob: Uint8Array
+    }
+
+    let opIdCounter = 1
+    const operationsTable: StoredOp[] = []
+
+    liveDoc.on('update', (u: Uint8Array) => {
+      operationsTable.push({
+        id: opIdCounter++,
+        hlc: generateHLC('worker'),
+        blob: new Uint8Array(u),
+      })
+    })
+
+    // Apply 25 initial edits
+    for (let i = 0; i < 25; i++) {
+      yText.insert(yText.length, `entry_${i};`)
+    }
+
+    // Compaction step:
+    // Take snapshot checkpoint of live doc
+    const snapshotBlob = Y.encodeStateAsUpdate(liveDoc)
+    const compactionCutoffHLC = operationsTable[operationsTable.length - 1].hlc
+
+    // Prune compacted operations from table (simulate DELETE WHERE hlc <= compactionCutoffHLC)
+    const remainingOps = operationsTable.filter((op) => op.hlc > compactionCutoffHLC)
+    expect(remainingOps.length).toBe(0)
+
+    // Add 15 new operations after compaction
+    for (let i = 25; i < 40; i++) {
+      yText.insert(yText.length, `entry_${i};`)
+    }
+
+    const uncompactedTailOps = operationsTable.filter((op) => op.hlc > compactionCutoffHLC)
+    expect(uncompactedTailOps.length).toBe(15)
+
+    // Recover document using Snapshot + subsequent uncompacted tail operations
+    const recoveredDoc = new Y.Doc()
+    Y.applyUpdate(recoveredDoc, snapshotBlob)
+    for (const op of uncompactedTailOps) {
+      Y.applyUpdate(recoveredDoc, op.blob)
+    }
+
+    // Document state must be 100% equivalent to the live document
+    expect(recoveredDoc.getText('code').toString()).toBe(liveDoc.getText('code').toString())
+    expect(recoveredDoc.getText('code').length).toBe(liveDoc.getText('code').length)
   })
 })

@@ -41,34 +41,59 @@ app.get('/rooms/:name/info', (req, res) => {
   })
 })
 
-// Time-Travel History endpoint
+// Time-Travel History endpoint with Snapshot-Assisted Recovery
 app.get('/doc/:id/history', async (req, res) => {
   try {
     const docId = req.params.id || 'demo'
     const beforeHLC = (req.query.before as string) || 'zzzzzzzzzzzz-zzzz-zzzz'
 
-    // Postgres fetches operations that happened strictly up to `beforeHLC`
-    const { rows } = await dbPool.query(
-      `SELECT update_blob FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2 ORDER BY hlc_timestamp ASC, id ASC`,
+    // 1. Check if there is an applicable compacted snapshot before or at beforeHLC
+    const snapshotRes = await dbPool.query(
+      `SELECT snapshot_blob, hlc_cutoff FROM doc_snapshots 
+       WHERE doc_id = $1 AND hlc_cutoff <= $2 
+       ORDER BY hlc_cutoff DESC, id DESC LIMIT 1`,
       [docId, beforeHLC]
     )
 
-    const ops = rows.map((r) => r.update_blob.toString('base64'))
-    res.json({ ops, count: ops.length })
+    let baseSnapshotBase64: string | null = null
+    let afterHLC = '0'
+
+    if (snapshotRes.rows.length > 0) {
+      baseSnapshotBase64 = snapshotRes.rows[0].snapshot_blob.toString('base64')
+      afterHLC = snapshotRes.rows[0].hlc_cutoff
+    }
+
+    // 2. Fetch delta operations that occurred strictly after the snapshot cutoff up to beforeHLC
+    const { rows } = await dbPool.query(
+      `SELECT update_blob FROM operations 
+       WHERE doc_id = $1 AND hlc_timestamp > $2 AND hlc_timestamp <= $3 
+       ORDER BY hlc_timestamp ASC, id ASC`,
+      [docId, afterHLC, beforeHLC]
+    )
+
+    const deltaOps = rows.map((r) => r.update_blob.toString('base64'))
+    const ops = baseSnapshotBase64 ? [baseSnapshotBase64, ...deltaOps] : deltaOps
+
+    res.json({
+      ops,
+      count: ops.length,
+      snapshotAssisted: baseSnapshotBase64 !== null,
+      snapshotCutoffHLC: afterHLC,
+    })
   } catch (err: any) {
     console.error('[http] history fetch error:', err.message)
     res.status(500).json({ error: 'Failed to fetch history' })
   }
 })
 
-// Snapshot Trigger Endpoint (Manual or scheduled compaction)
+// Snapshot Trigger Endpoint (Captures document checkpoint)
 app.post('/doc/:id/snapshot', async (req, res) => {
   try {
     const docId = req.params.id
     const room = getRoom(docId)
     await room.loadedPromise
     const snapshot = Y.encodeStateAsUpdate(room.doc)
-    
+
     // Find highest HLC currently stored for this doc
     const hlcRes = await dbPool.query(
       `SELECT hlc_timestamp FROM operations WHERE doc_id = $1 ORDER BY hlc_timestamp DESC, id DESC LIMIT 1`,
@@ -85,6 +110,58 @@ app.post('/doc/:id/snapshot', async (req, res) => {
   } catch (err: any) {
     console.error('[http] snapshot creation error:', err.message)
     res.status(500).json({ error: 'Failed to create snapshot' })
+  }
+})
+
+// Transactional Log Compaction Endpoint (Checkpoint + Operation Pruning)
+app.post('/doc/:id/compact', async (req, res) => {
+  const client = await dbPool.connect()
+  try {
+    const docId = req.params.id
+    const room = getRoom(docId)
+    await room.loadedPromise
+    const snapshot = Y.encodeStateAsUpdate(room.doc)
+
+    await client.query('BEGIN')
+
+    const hlcRes = await client.query(
+      `SELECT hlc_timestamp FROM operations WHERE doc_id = $1 ORDER BY hlc_timestamp DESC, id DESC LIMIT 1 FOR UPDATE`,
+      [docId]
+    )
+    const latestHlc = hlcRes.rows[0]?.hlc_timestamp
+
+    if (!latestHlc) {
+      await client.query('ROLLBACK')
+      return res.json({ success: true, message: 'No operations to compact', docId })
+    }
+
+    // Insert durable snapshot checkpoint
+    await client.query(
+      `INSERT INTO doc_snapshots (doc_id, snapshot_blob, hlc_cutoff) VALUES ($1, $2, $3)`,
+      [docId, Buffer.from(snapshot), latestHlc]
+    )
+
+    // Atomically delete operations older than or equal to the checkpoint HLC
+    const deleteRes = await client.query(
+      `DELETE FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2`,
+      [docId, latestHlc]
+    )
+
+    await client.query('COMMIT')
+
+    res.json({
+      success: true,
+      docId,
+      hlcCutoff: latestHlc,
+      compactedOperations: deleteRes.rowCount,
+      snapshotBytes: snapshot.byteLength,
+    })
+  } catch (err: any) {
+    await client.query('ROLLBACK')
+    console.error('[http] compaction error:', err.message)
+    res.status(500).json({ error: 'Failed to execute compaction' })
+  } finally {
+    client.release()
   }
 })
 
@@ -112,7 +189,7 @@ wss.on('connection', (ws, req) => {
 // Graceful shutdown handling
 const shutdown = async (signal: string) => {
   console.log(`[lifecycle] Received ${signal}. Shutting down gracefully...`)
-  
+
   // Close WebSocket server
   wss.close(() => {
     console.log('[lifecycle] WebSocket server closed.')

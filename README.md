@@ -82,11 +82,11 @@ All metrics represent real measurements executed on Apple Silicon (`darwin arm64
 ### 2. Micro-Operation Latency & Database Performance
 | Metric | Measured Result |
 | :--- | :--- |
-| **In-Memory Sync Latency (Mean)** | **15.12 µs** (P50: 12.17 µs, P99: 124.79 µs) |
-| **Cold Recovery Speedup (Snapshot vs Replay)** | **9.09x faster** (0.21 ms vs 1.95 ms) |
+| **In-Memory CRDT Sync Latency (Median)** | **14.12 µs** (Mean: 37.97 µs, P90: 39.46 µs) |
+| **Cold Recovery Speedup (Snapshot vs Replay)** | **3.75x faster** (Median: 0.20 ms vs 0.76 ms) |
 | **Storage Compaction Ratio** | **75.62% reduction** (7,456 bytes $\to$ 1,818 bytes) |
-| **PostgreSQL Single-Row Write Latency** | **0.30 ms** (P50: 0.21 ms, P95: 0.55 ms) |
-| **50-Replica Swarm Convergence** | **8.04 ms** across 50 distributed peer nodes |
+| **PostgreSQL Single-Row Write Latency** | **0.29 ms** (P50: 0.20 ms, P95: 0.48 ms) |
+| **50-Replica In-Memory Swarm Convergence** | **13.13 ms** across 50 in-memory peer replicas |
 
 ---
 
@@ -130,7 +130,7 @@ pnpm benchmark
 
 ## 🧪 Testing Standard
 
-Run the formal verification suite (18 unit & integration tests):
+Run the formal verification suite (19 unit & integration tests):
 
 ```bash
 pnpm --filter server test
@@ -138,14 +138,14 @@ pnpm --filter server test
 
 ```
 PASS src/__tests__/hlc-and-recovery.test.ts
+PASS src/__tests__/crdt-convergence.test.ts
 PASS src/__tests__/distributed-correctness.test.ts
 PASS src/__tests__/workspace-invariants.test.ts
-PASS src/__tests__/crdt-convergence.test.ts
 
 Test Suites: 4 passed, 4 total
-Tests:       18 passed, 18 total
+Tests:       19 passed, 19 total
 Snapshots:   0 total
-Time:        0.804 s
+Time:        0.768 s
 ```
 
 ---
