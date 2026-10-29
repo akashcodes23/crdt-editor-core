@@ -14,9 +14,19 @@ import {
   isValidDocId,
   isOriginAllowed,
 } from './security.js'
+import { resolvePort, DEFAULT_PORT } from './port.js'
 
-const PORT = parseInt(process.env.PORT ?? '1234', 10)
-const HOST = process.env.HOST ?? '0.0.0.0'
+let resolvedPort: number
+try {
+  resolvedPort = resolvePort(process.env.PORT)
+} catch (err: any) {
+  console.error(`❌  FATAL NETWORK CONFIGURATION ERROR: ${err.message}`)
+  process.exit(1)
+}
+
+export const PORT = resolvedPort
+export const HOST = process.env.HOST ?? '0.0.0.0'
+export { resolvePort, DEFAULT_PORT }
 
 // Validate production security configuration before binding ports
 const secValidation = validateProductionSecurityConfig()

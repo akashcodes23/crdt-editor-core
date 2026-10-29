@@ -1,8 +1,35 @@
 // packages/server/src/db.ts
 import { Pool, PoolConfig } from 'pg'
 
+// Determine if SSL is required for managed database connection (e.g. Neon, Supabase, Render, AWS RDS)
+const hasSslInUrl =
+  typeof process.env.DATABASE_URL === 'string' &&
+  (process.env.DATABASE_URL.includes('sslmode=require') ||
+    process.env.DATABASE_URL.includes('neon.tech') ||
+    process.env.DATABASE_URL.includes('ssl=true'))
+
+const useSsl =
+  process.env.DATABASE_SSL === 'true' ||
+  process.env.PGSSL === 'true' ||
+  (hasSslInUrl && process.env.DATABASE_SSL !== 'false')
+
+// Certificate verification MUST remain enabled by default (rejectUnauthorized: true) in production TLS.
+// Only allow disabling if the operator explicitly configures DATABASE_SSL_REJECT_UNAUTHORIZED=false.
+const rejectUnauthorized = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false'
+
+if (useSsl && !rejectUnauthorized) {
+  console.warn(
+    '[security] WARNING: DATABASE_SSL_REJECT_UNAUTHORIZED is set to false. PostgreSQL TLS certificate validation is disabled (vulnerable to MITM). Do not use this in production unless connecting to a verified private host with a custom CA.'
+  )
+}
+
+const sslConfig = useSsl ? { rejectUnauthorized } : undefined
+
 const poolConfig: PoolConfig = process.env.DATABASE_URL
-  ? { connectionString: process.env.DATABASE_URL }
+  ? {
+      connectionString: process.env.DATABASE_URL,
+      ...(sslConfig ? { ssl: sslConfig } : {}),
+    }
   : {
       user: process.env.PGUSER || process.env.POSTGRES_USER || 'crdt',
       password: process.env.PGPASSWORD || process.env.POSTGRES_PASSWORD || 'password',
@@ -12,6 +39,7 @@ const poolConfig: PoolConfig = process.env.DATABASE_URL
       max: 20,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 5000,
+      ...(sslConfig ? { ssl: sslConfig } : {}),
     }
 
 export const dbPool = new Pool(poolConfig)

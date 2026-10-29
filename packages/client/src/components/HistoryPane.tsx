@@ -6,6 +6,7 @@ import dynamic from 'next/dynamic'
 import type monaco from 'monaco-editor'
 import { MonacoBinding } from 'y-monaco'
 import { colorFromClientId } from '@/lib/colors'
+import { HTTP_API_URL, CONVERGE_AUTH_TOKEN } from '@/lib/yjs'
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), {
   ssr: false,
@@ -38,7 +39,13 @@ export function HistoryPane({ onClose, docId = 'demo' }: HistoryPaneProps) {
     const beforeHLC = `${timeStr}-ffff-zzzz` // upper bound for that ms
 
     try {
-      const res = await fetch(`http://localhost:1234/doc/${docId}/history?before=${beforeHLC}`)
+      const headers: Record<string, string> = {}
+      if (CONVERGE_AUTH_TOKEN) {
+        headers['Authorization'] = `Bearer ${CONVERGE_AUTH_TOKEN}`
+      }
+      const res = await fetch(`${HTTP_API_URL}/doc/${docId}/history?before=${beforeHLC}`, {
+        headers,
+      })
       if (!res.ok) throw new Error('Fetch failed')
       const data = await res.json()
       

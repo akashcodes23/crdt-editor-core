@@ -284,11 +284,15 @@ export function isAuthorizedForRoom(
     return { authorized: false, reason: 'ADMIN_ROLE_REQUIRED' }
   }
 
-  // Check room scope
+  // Check room scope: exact match, array membership, or prefix wildcard (e.g. 'demo-*')
   const isRoomAllowed =
     claims.room === '*' ||
     claims.room === requestedRoom ||
-    (Array.isArray(claims.rooms) && claims.rooms.includes(requestedRoom))
+    (Array.isArray(claims.rooms) && claims.rooms.includes(requestedRoom)) ||
+    (typeof claims.room === 'string' &&
+      claims.room.endsWith('*') &&
+      claims.room.length > 1 &&
+      requestedRoom.startsWith(claims.room.slice(0, -1)))
 
   if (!isRoomAllowed) {
     return { authorized: false, reason: `UNAUTHORIZED_ROOM: Token not authorized for room "${requestedRoom}"` }

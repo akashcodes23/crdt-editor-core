@@ -1,4 +1,5 @@
 import http from 'http'
+import crypto from 'crypto'
 import express from 'express'
 import { AddressInfo } from 'net'
 import WebSocket, { WebSocketServer } from 'ws'
@@ -97,6 +98,139 @@ describe('Security Hardening Suite (SEC-01 through SEC-04)', () => {
       const diff = (res.claims?.exp || 0) - before
       expect(diff).toBeGreaterThanOrEqual(23 * 60 * 60 * 1000)
       expect(diff).toBeLessThanOrEqual(25 * 60 * 60 * 1000)
+    })
+
+    it('accepts tokens with long TTLs such as 180 days when exp is in milliseconds', () => {
+      const now = Date.now()
+      const ttl180DaysMs = 180 * 24 * 60 * 60 * 1000
+      const token180 = createAuthToken(
+        {
+          sub: 'portfolio-visitor',
+          room: 'demo',
+          role: 'editor',
+          exp: now + ttl180DaysMs,
+        },
+        TEST_SECRET
+      )
+      const res = verifyAuthToken(token180, TEST_SECRET)
+      expect(res.valid).toBe(true)
+      expect(res.claims?.sub).toBe('portfolio-visitor')
+      expect(res.claims?.room).toBe('demo')
+      expect(res.claims?.role).toBe('editor')
+      expect(res.claims?.exp).toBe(now + ttl180DaysMs)
+    })
+
+    it('rejects expired tokens and tokens mistakenly minted with Unix seconds instead of milliseconds', () => {
+      // 1. Expired token in milliseconds
+      const expiredToken = createAuthToken(
+        {
+          sub: 'visitor',
+          room: 'demo',
+          exp: Date.now() - 5000,
+        },
+        TEST_SECRET
+      )
+      const resExpired = verifyAuthToken(expiredToken, TEST_SECRET)
+      expect(resExpired.valid).toBe(false)
+      expect(resExpired.error).toBe('TOKEN_EXPIRED')
+
+      // 2. Erroneous token minted using Unix seconds (standard JWT format) instead of milliseconds
+      // Date.now() in seconds is ~1.73e9, which against Date.now() in ms (~1.73e12) is far in the past (~year 1970)
+      const unixSeconds = Math.floor(Date.now() / 1000) + 86400 // "tomorrow" in seconds
+      const claimsWithSeconds = {
+        sub: 'visitor',
+        room: 'demo',
+        role: 'editor',
+        iat: Math.floor(Date.now() / 1000),
+        exp: unixSeconds,
+      }
+      const b64 = Buffer.from(JSON.stringify(claimsWithSeconds))
+        .toString('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+      const sig = crypto
+        .createHmac('sha256', TEST_SECRET)
+        .update(b64)
+        .digest('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+      const tokenSeconds = `${b64}.${sig}`
+
+      const resSeconds = verifyAuthToken(tokenSeconds, TEST_SECRET)
+      expect(resSeconds.valid).toBe(false)
+      expect(resSeconds.error).toBe('TOKEN_EXPIRED')
+    })
+
+    it('rejects tokens with missing, non-numeric, or malformed exp claims', () => {
+      // Missing exp
+      const missingExpPayload = { sub: 'attacker', room: 'demo' }
+      const b64Missing = Buffer.from(JSON.stringify(missingExpPayload))
+        .toString('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+      const sigMissing = crypto
+        .createHmac('sha256', TEST_SECRET)
+        .update(b64Missing)
+        .digest('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+      const resMissing = verifyAuthToken(`${b64Missing}.${sigMissing}`, TEST_SECRET)
+      expect(resMissing.valid).toBe(false)
+      expect(resMissing.error).toBe('MISSING_EXPIRATION')
+
+      // String exp (e.g. "2030-01-01" or "never")
+      const stringExpPayload = { sub: 'attacker', room: 'demo', exp: '2030-01-01' }
+      const b64String = Buffer.from(JSON.stringify(stringExpPayload))
+        .toString('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+      const sigString = crypto
+        .createHmac('sha256', TEST_SECRET)
+        .update(b64String)
+        .digest('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+      const resString = verifyAuthToken(`${b64String}.${sigString}`, TEST_SECRET)
+      expect(resString.valid).toBe(false)
+      expect(resString.error).toBe('MISSING_EXPIRATION')
+    })
+
+    it('validates the exact token-generation command documented in docs/DEPLOYMENT.md', () => {
+      // Exactly replicates the node -e script in docs/DEPLOYMENT.md
+      const now = Date.now()
+      const claims = {
+        sub: 'portfolio-visitor',
+        role: 'editor',
+        room: 'demo',
+        iat: now,
+        exp: now + 180 * 24 * 60 * 60 * 1000,
+      }
+      const b64 = Buffer.from(JSON.stringify(claims))
+        .toString('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+      const sig = crypto
+        .createHmac('sha256', TEST_SECRET)
+        .update(b64)
+        .digest('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+      const visitorToken = `${b64}.${sig}`
+
+      const res = verifyAuthToken(visitorToken, TEST_SECRET)
+      expect(res.valid).toBe(true)
+      expect(res.claims?.sub).toBe('portfolio-visitor')
+      expect(res.claims?.role).toBe('editor')
+      expect(res.claims?.room).toBe('demo')
+      expect(res.claims?.exp).toBe(now + 180 * 24 * 60 * 60 * 1000)
     })
 
     it('rejects minting tokens without subject or with weak secret', () => {
@@ -201,6 +335,13 @@ describe('Security Hardening Suite (SEC-01 through SEC-04)', () => {
       const adminClaims = { sub: 'admin', role: 'admin' as const }
       expect(isAuthorizedForRoom(adminClaims, 'any-room', 'editor').authorized).toBe(true)
       expect(isAuthorizedForRoom(adminClaims, 'any-room', 'admin').authorized).toBe(true)
+
+      // Prefix wildcard room authorization (e.g. demo-* for visitor-isolated rooms)
+      const prefixClaims = { sub: 'visitor', room: 'demo-*', role: 'editor' as const }
+      expect(isAuthorizedForRoom(prefixClaims, 'demo-scratchpad', 'editor').authorized).toBe(true)
+      expect(isAuthorizedForRoom(prefixClaims, 'demo-user-123', 'editor').authorized).toBe(true)
+      expect(isAuthorizedForRoom(prefixClaims, 'production-room', 'editor').authorized).toBe(false)
+      expect(isAuthorizedForRoom(prefixClaims, 'demoroom-without-hyphen', 'editor').authorized).toBe(false)
     })
   })
 
@@ -338,6 +479,43 @@ describe('Security Hardening Suite (SEC-01 through SEC-04)', () => {
       expect(resOk.status).toBe(200)
     })
 
+    it('restricts public visitor token scoped to room "demo" from admin endpoints and other rooms', async () => {
+      const visitorToken = createAuthToken(
+        {
+          sub: 'portfolio-visitor',
+          role: 'editor',
+          room: 'demo',
+        },
+        TEST_SECRET
+      )
+
+      // 1. Cannot snapshot room "demo" or any room (requires admin)
+      const resSnapshot = await fetch(`${httpUrl}/doc/demo/snapshot`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${visitorToken}` },
+      })
+      expect(resSnapshot.status).toBe(401)
+
+      // 2. Cannot compact room "demo" or any room (requires admin)
+      const resCompact = await fetch(`${httpUrl}/doc/demo/compact`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${visitorToken}` },
+      })
+      expect(resCompact.status).toBe(401)
+
+      // 3. Cannot read history for unrelated room
+      const resOtherHistory = await fetch(`${httpUrl}/doc/financial-records/history`, {
+        headers: { Authorization: `Bearer ${visitorToken}` },
+      })
+      expect(resOtherHistory.status).toBe(403)
+
+      // 4. Can read history for scoped room "demo"
+      const resDemoHistory = await fetch(`${httpUrl}/doc/demo/history`, {
+        headers: { Authorization: `Bearer ${visitorToken}` },
+      })
+      expect(resDemoHistory.status).toBe(200)
+    })
+
     it('returns 404 for inactive room info without allocating Room state in memory', async () => {
       const initialRoomCount = rooms.size
       const res = await fetch(`${httpUrl}/rooms/non-existent-room-xyz/info`)
@@ -447,6 +625,37 @@ describe('Security Hardening Suite (SEC-01 through SEC-04)', () => {
       // Invariant: Token is NOT selected as the negotiated protocol and NOT echoed
       expect(protocol).not.toContain(token)
       ws.close()
+    })
+
+    it('allows public visitor token to connect to room "demo" but strictly blocks connecting to "private-room"', async () => {
+      const visitorToken = createAuthToken(
+        {
+          sub: 'portfolio-visitor',
+          role: 'editor',
+          room: 'demo',
+        },
+        TEST_SECRET
+      )
+
+      // 1. Connection to "demo" succeeds
+      const wsDemo = new WebSocket(`${wsBaseUrl}/demo`, ['converge.v1', `converge.token.${visitorToken}`], {
+        headers: { Origin: 'http://localhost:3000' },
+      })
+      const openDemo = await new Promise<boolean>((resolve) => {
+        wsDemo.on('open', () => resolve(true))
+        wsDemo.on('close', () => resolve(false))
+      })
+      expect(openDemo).toBe(true)
+      wsDemo.close()
+
+      // 2. Connection to "private-room" is rejected with 4403 FORBIDDEN
+      const wsPrivate = new WebSocket(`${wsBaseUrl}/private-room`, ['converge.v1', `converge.token.${visitorToken}`], {
+        headers: { Origin: 'http://localhost:3000' },
+      })
+      const closePrivate = await new Promise<{ code: number; reason: string }>((resolve) => {
+        wsPrivate.on('close', (code, reason) => resolve({ code, reason: reason.toString() }))
+      })
+      expect(closePrivate.code).toBe(WS_CLOSE_FORBIDDEN)
     })
 
     it('rejects attempt to pass auth token in query string (?token=...) to prevent URL logging', async () => {

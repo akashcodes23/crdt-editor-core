@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as Y from 'yjs'
 import { IndexeddbPersistence } from 'y-indexeddb'
-import { WS_URL, ROOM_NAME } from '@/lib/yjs'
+import { WS_URL, ROOM_NAME, CONVERGE_AUTH_TOKEN } from '@/lib/yjs'
 import { DurableSyncClient, type SaveState } from '@/lib/durable-client'
 
 export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
@@ -64,7 +64,7 @@ export function useYDoc(clientLabel: string): UseYDocResult {
     const provider = new DurableSyncClient(`${WS_URL}/${ROOM_NAME}`, doc, {
       connect: true,
       autoSubmit: true,
-      token: process.env.NEXT_PUBLIC_CONVERGE_TOKEN,
+      token: CONVERGE_AUTH_TOKEN || undefined,
     })
     providerRef.current = provider
     provider.on('status', ({ status: s }: { status: string }) => {
