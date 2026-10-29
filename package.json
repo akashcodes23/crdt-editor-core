@@ -6,7 +6,9 @@
     "build": "pnpm --filter server build && pnpm --filter client build",
     "typecheck": "pnpm --filter server typecheck && pnpm --filter client typecheck",
     "test": "pnpm --filter server test",
-    "benchmark": "pnpm --filter server benchmark"
+    "benchmark": "pnpm --filter server benchmark",
+    "benchmark:recovery": "pnpm --filter server run benchmark:recovery",
+    "benchmark:semantic-guard": "pnpm --filter server run benchmark:semantic-guard"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

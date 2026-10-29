@@ -7,8 +7,10 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "start": "node dist/index.js",
-    "test": "jest --forceExit",
-    "benchmark": "tsx scripts/benchmark.ts"
+    "test": "jest --runInBand --forceExit",
+    "benchmark": "tsx scripts/benchmark.ts",
+    "benchmark:recovery": "tsx scripts/benchmark-recovery.ts",
+    "benchmark:semantic-guard": "tsx scripts/benchmark-semantic-guard.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

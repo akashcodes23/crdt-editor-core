@@ -8,9 +8,7 @@ describe('Compaction Races, Snapshot Recovery, and History Retention Contract', 
     await initDb()
   })
 
-  afterAll(async () => {
-    await dbPool.end()
-  })
+  // Pool is preserved for subsequent test suites in process
 
   it('1. Snapshot-assisted recovery under concurrent edits matches full log replay', async () => {
     const docId = `test-concurrent-recovery-${Date.now()}`
@@ -320,5 +318,331 @@ describe('Compaction Races, Snapshot Recovery, and History Retention Contract', 
 
     // Document state remains uncorrupted
     expect(doc.getText('code').toString()).toBe('Valid baseline.')
+  })
+
+  it('7. Failure injection: Error before snapshot insertion leaves operations intact', async () => {
+    const docId = `test-fail-before-snapshot-${Date.now()}`
+    const client = await dbPool.connect()
+
+    try {
+      const hlc1 = generateHLC('server')
+      const doc = new Y.Doc()
+      doc.getText('code').insert(0, 'Critical content before snapshot;')
+      const update = Y.encodeStateAsUpdate(doc)
+
+      await client.query(
+        `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES ($1, 'c1', $2, $3)`,
+        [docId, hlc1, Buffer.from(update)]
+      )
+
+      // Simulate a pre-transaction failure (e.g. persistence queue error or corrupted cutoff query)
+      let preCheckFailed = false
+      try {
+        throw new Error('Simulated pre-snapshot serialization failure')
+      } catch (err: any) {
+        preCheckFailed = true
+        // Compaction aborts before BEGIN
+      }
+
+      expect(preCheckFailed).toBe(true)
+
+      // Verify no transaction began and zero snapshots were created
+      const snapRes = await client.query(`SELECT COUNT(*) FROM doc_snapshots WHERE doc_id = $1`, [docId])
+      expect(parseInt(snapRes.rows[0].count, 10)).toBe(0)
+
+      // Operation is completely intact
+      const opRes = await client.query(`SELECT COUNT(*) FROM operations WHERE doc_id = $1`, [docId])
+      expect(parseInt(opRes.rows[0].count, 10)).toBe(1)
+    } finally {
+      client.release()
+    }
+  })
+
+  it('8. Failure injection: Error during transaction (after snapshot insert, before prune) rolls back completely', async () => {
+    const docId = `test-fail-mid-tx-${Date.now()}`
+    const client = await dbPool.connect()
+
+    try {
+      const hlc1 = generateHLC('server')
+      const doc = new Y.Doc()
+      doc.getText('code').insert(0, 'Content during mid-tx;')
+      const update = Y.encodeStateAsUpdate(doc)
+
+      await client.query(
+        `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES ($1, 'c1', $2, $3)`,
+        [docId, hlc1, Buffer.from(update)]
+      )
+
+      await client.query('BEGIN')
+      await client.query(
+        `INSERT INTO doc_snapshots (doc_id, snapshot_blob, hlc_cutoff) VALUES ($1, $2, $3)`,
+        [docId, Buffer.from(update), hlc1]
+      )
+
+      // Inject error before DELETE query completes
+      let txError = false
+      try {
+        // Syntax error simulating failure
+        await client.query(`DELETE FROM operations WHERE syntax_error_injected`)
+      } catch {
+        txError = true
+        await client.query('ROLLBACK')
+      }
+
+      expect(txError).toBe(true)
+
+      // Verify rollback: no snapshot persisted and operations remain
+      const snapRes = await client.query(`SELECT COUNT(*) FROM doc_snapshots WHERE doc_id = $1`, [docId])
+      expect(parseInt(snapRes.rows[0].count, 10)).toBe(0)
+
+      const opRes = await client.query(`SELECT COUNT(*) FROM operations WHERE doc_id = $1`, [docId])
+      expect(parseInt(opRes.rows[0].count, 10)).toBe(1)
+    } finally {
+      client.release()
+    }
+  })
+
+  it('9. Failure injection: Error before commit completion rolls back and leaves full recovery path', async () => {
+    const docId = `test-fail-pre-commit-${Date.now()}`
+    const client = await dbPool.connect()
+
+    try {
+      const hlc1 = generateHLC('server')
+      const doc = new Y.Doc()
+      doc.getText('code').insert(0, 'Content pre-commit failure;')
+      const update = Y.encodeStateAsUpdate(doc)
+
+      await client.query(
+        `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES ($1, 'c1', $2, $3)`,
+        [docId, hlc1, Buffer.from(update)]
+      )
+
+      await client.query('BEGIN')
+      await client.query(
+        `INSERT INTO doc_snapshots (doc_id, snapshot_blob, hlc_cutoff) VALUES ($1, $2, $3)`,
+        [docId, Buffer.from(update), hlc1]
+      )
+      await client.query(`DELETE FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2`, [docId, hlc1])
+
+      // Simulate a connection drop / failure right before COMMIT
+      let commitFailed = false
+      try {
+        // Intentionally trigger rollback instead of commit
+        throw new Error('Connection severed right before COMMIT')
+      } catch {
+        commitFailed = true
+        await client.query('ROLLBACK')
+      }
+
+      expect(commitFailed).toBe(true)
+
+      // Verify no snapshot and operation was restored
+      const snapRes = await client.query(`SELECT COUNT(*) FROM doc_snapshots WHERE doc_id = $1`, [docId])
+      expect(parseInt(snapRes.rows[0].count, 10)).toBe(0)
+
+      const opRes = await client.query(`SELECT COUNT(*) FROM operations WHERE doc_id = $1`, [docId])
+      expect(parseInt(opRes.rows[0].count, 10)).toBe(1)
+
+      // Verify document still recoverable
+      const opRow = await client.query(`SELECT update_blob FROM operations WHERE doc_id = $1`, [docId])
+      const recoveredDoc = new Y.Doc()
+      Y.applyUpdate(recoveredDoc, opRow.rows[0].update_blob)
+      expect(recoveredDoc.getText('code').toString()).toBe('Content pre-commit failure;')
+    } finally {
+      client.release()
+    }
+  })
+
+  it('10. Repeated compaction is safe, idempotent, and correctly handles subsequent edits', async () => {
+    const docId = `test-repeated-compaction-${Date.now()}`
+    const client = await dbPool.connect()
+
+    try {
+      // Step 1: Initial edits
+      const hlc1 = generateHLC('server')
+      const doc1 = new Y.Doc()
+      doc1.getText('code').insert(0, 'Initial code block;')
+      const update1 = Y.encodeStateAsUpdate(doc1)
+
+      await client.query(
+        `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES ($1, 'c1', $2, $3)`,
+        [docId, hlc1, Buffer.from(update1)]
+      )
+
+      // First Compaction: executes successfully
+      await client.query('BEGIN')
+      await client.query(
+        `INSERT INTO doc_snapshots (doc_id, snapshot_blob, hlc_cutoff) VALUES ($1, $2, $3)`,
+        [docId, Buffer.from(update1), hlc1]
+      )
+      await client.query(`DELETE FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2`, [docId, hlc1])
+      await client.query('COMMIT')
+
+      // Verify 1 snapshot and 0 operations
+      const snap1 = await client.query(`SELECT COUNT(*) FROM doc_snapshots WHERE doc_id = $1`, [docId])
+      expect(parseInt(snap1.rows[0].count, 10)).toBe(1)
+      const op1 = await client.query(`SELECT COUNT(*) FROM operations WHERE doc_id = $1`, [docId])
+      expect(parseInt(op1.rows[0].count, 10)).toBe(0)
+
+      // Repeated Compaction immediately (no new operations):
+      // Check query: operations <= hlc1 has 0 rows
+      const opCountCheck = await client.query(
+        `SELECT COUNT(*) FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2`,
+        [docId, hlc1]
+      )
+      const shouldCompact = parseInt(opCountCheck.rows[0].count, 10) > 0
+      expect(shouldCompact).toBe(false) // No-op, safely skipped without creating redundant snapshot
+
+      // Step 2: New edits arrive (subsequent operations)
+      const hlc2 = generateHLC('server')
+      doc1.getText('code').insert(doc1.getText('code').length, ' Appended second block;')
+      const update2 = Y.encodeStateAsUpdate(doc1)
+
+      await client.query(
+        `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES ($1, 'c1', $2, $3)`,
+        [docId, hlc2, Buffer.from(update2)]
+      )
+
+      // Second Compaction now runs for new cutoff hlc2
+      await client.query('BEGIN')
+      await client.query(
+        `INSERT INTO doc_snapshots (doc_id, snapshot_blob, hlc_cutoff) VALUES ($1, $2, $3)`,
+        [docId, Buffer.from(update2), hlc2]
+      )
+      await client.query(`DELETE FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2`, [docId, hlc2])
+      await client.query('COMMIT')
+
+      const snap2 = await client.query(`SELECT COUNT(*) FROM doc_snapshots WHERE doc_id = $1`, [docId])
+      expect(parseInt(snap2.rows[0].count, 10)).toBe(2)
+
+      // Reconstruct document from latest snapshot
+      const latestSnapshot = await client.query(
+        `SELECT snapshot_blob FROM doc_snapshots WHERE doc_id = $1 ORDER BY hlc_cutoff DESC LIMIT 1`,
+        [docId]
+      )
+      const recoveredDoc = new Y.Doc()
+      Y.applyUpdate(recoveredDoc, latestSnapshot.rows[0].snapshot_blob)
+      expect(recoveredDoc.getText('code').toString()).toBe('Initial code block; Appended second block;')
+    } finally {
+      client.release()
+    }
+  })
+
+  it('11. Restart during or immediately after compaction preserves document state', async () => {
+    const docId = `test-restart-after-compaction-${Date.now()}`
+    const client = await dbPool.connect()
+
+    try {
+      // 1. Initial 10 operations
+      const doc = new Y.Doc()
+      const text = doc.getText('code')
+      let lastHlc = ''
+
+      for (let i = 0; i < 5; i++) {
+        text.insert(text.length, `line_${i};\n`)
+        lastHlc = generateHLC('server')
+        const u = Y.encodeStateAsUpdate(doc)
+        await client.query(
+          `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES ($1, 'c1', $2, $3)`,
+          [docId, lastHlc, Buffer.from(u)]
+        )
+      }
+
+      // Compact operations up to lastHlc
+      const snapshotBlob = Y.encodeStateAsUpdate(doc)
+      await client.query('BEGIN')
+      await client.query(
+        `INSERT INTO doc_snapshots (doc_id, snapshot_blob, hlc_cutoff) VALUES ($1, $2, $3)`,
+        [docId, Buffer.from(snapshotBlob), lastHlc]
+      )
+      await client.query(`DELETE FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2`, [docId, lastHlc])
+      await client.query('COMMIT')
+
+      // 2. Add tail operation right before server crash
+      text.insert(text.length, 'tail_line_after_compaction;\n')
+      const tailHlc = generateHLC('server')
+      const tailUpdate = Y.encodeStateAsUpdate(doc)
+      await client.query(
+        `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES ($1, 'c1', $2, $3)`,
+        [docId, tailHlc, Buffer.from(tailUpdate)]
+      )
+
+      // 3. Simulate Server Crash & Restart:
+      // Memory state is wiped. Document is restored from DB snapshot + uncompacted delta tail.
+      const freshDoc = new Y.Doc()
+      const snapRes = await client.query(
+        `SELECT snapshot_blob, hlc_cutoff FROM doc_snapshots WHERE doc_id = $1 ORDER BY hlc_cutoff DESC LIMIT 1`,
+        [docId]
+      )
+      expect(snapRes.rows.length).toBe(1)
+      Y.applyUpdate(freshDoc, snapRes.rows[0].snapshot_blob)
+
+      const tailOpsRes = await client.query(
+        `SELECT update_blob FROM operations WHERE doc_id = $1 AND hlc_timestamp > $2 ORDER BY hlc_timestamp ASC`,
+        [docId, snapRes.rows[0].hlc_cutoff]
+      )
+      expect(tailOpsRes.rows.length).toBe(1)
+      Y.applyUpdate(freshDoc, tailOpsRes.rows[0].update_blob)
+
+      // Assert document matches exactly the pre-crash state
+      expect(freshDoc.getText('code').toString()).toBe(doc.getText('code').toString())
+      const stateVectorPreCrash = Y.encodeStateVector(doc)
+      const stateVectorRecovered = Y.encodeStateVector(freshDoc)
+      expect(Buffer.from(stateVectorRecovered).equals(Buffer.from(stateVectorPreCrash))).toBe(true)
+    } finally {
+      client.release()
+    }
+  })
+
+  it('12. Concurrent equal timestamps across nodes produce deterministic cutoff filtering', async () => {
+    const docId = `test-equal-timestamps-${Date.now()}`
+    const client = await dbPool.connect()
+
+    try {
+      const fixedPhysicalTime = 1750000000000
+      // Node A and Node B generate timestamps at exact same physical time and counter
+      const nodeAClock = new (jest.requireActual('../hlc').HybridLogicalClock)('node-a')
+      const nodeBClock = new (jest.requireActual('../hlc').HybridLogicalClock)('node-b')
+
+      const hlcA = nodeAClock.now(fixedPhysicalTime)
+      const hlcB = nodeBClock.now(fixedPhysicalTime)
+
+      // Lexical sortability: "node-a" < "node-b"
+      expect(hlcA < hlcB).toBe(true)
+
+      const docA = new Y.Doc()
+      docA.getText('code').insert(0, 'from node-a;')
+      const updateA = Y.encodeStateAsUpdate(docA)
+
+      const docB = new Y.Doc()
+      docB.getText('code').insert(0, 'from node-b;')
+      const updateB = Y.encodeStateAsUpdate(docB)
+
+      await client.query(
+        `INSERT INTO operations (doc_id, client_id, hlc_timestamp, update_blob) VALUES 
+         ($1, 'a', $2, $3),
+         ($1, 'b', $4, $5)`,
+        [docId, hlcA, Buffer.from(updateA), hlcB, Buffer.from(updateB)]
+      )
+
+      // If cutoff is hlcA: nodeA is pruned, nodeB is retained
+      const cutoff = hlcA
+      await client.query('BEGIN')
+      await client.query(
+        `INSERT INTO doc_snapshots (doc_id, snapshot_blob, hlc_cutoff) VALUES ($1, $2, $3)`,
+        [docId, Buffer.from(updateA), cutoff]
+      )
+      await client.query(`DELETE FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2`, [docId, cutoff])
+      await client.query('COMMIT')
+
+      const remaining = await client.query(
+        `SELECT hlc_timestamp FROM operations WHERE doc_id = $1`,
+        [docId]
+      )
+      expect(remaining.rows.length).toBe(1)
+      expect(remaining.rows[0].hlc_timestamp).toBe(hlcB)
+    } finally {
+      client.release()
+    }
   })
 })

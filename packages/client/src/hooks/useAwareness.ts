@@ -1,9 +1,14 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { WebsocketProvider } from 'y-websocket'
+import type * as Y from 'yjs'
 import type { Awareness } from 'y-protocols/awareness'
 import { colorFromClientId } from '@/lib/colors'
+
+export interface AwarenessProvider {
+  awareness: Awareness
+  doc: Y.Doc
+}
 
 export interface RemoteCursorState {
   clientID: number
@@ -17,7 +22,7 @@ export interface RemoteCursorState {
  * The local client is excluded from the returned list.
  */
 export function useAwareness(
-  provider: WebsocketProvider | null,
+  provider: AwarenessProvider | null,
   localName: string
 ): RemoteCursorState[] {
   const [remoteStates, setRemoteStates] = useState<RemoteCursorState[]>([])
@@ -78,7 +83,7 @@ export function useAwareness(
  * Call this from Monaco's onDidChangeCursorSelection.
  */
 export function setAwarenessCursor(
-  provider: WebsocketProvider | null,
+  provider: AwarenessProvider | null,
   cursor: { index: number; length: number } | null
 ): void {
   if (!provider) return

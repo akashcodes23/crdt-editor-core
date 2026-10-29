@@ -3,8 +3,8 @@ import * as awarenessProtocol from 'y-protocols/awareness'
 
 // ── Shared Yjs document key ───────────────────────────────────────────────────
 export const TEXT_KEY = 'code'
-export const WS_URL = 'ws://localhost:1234'
-export const ROOM_NAME = 'demo'
+export const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:1234'
+export const ROOM_NAME = process.env.NEXT_PUBLIC_ROOM_NAME || 'demo'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

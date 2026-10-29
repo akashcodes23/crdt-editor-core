@@ -439,3 +439,612 @@ describe('Converge Semantic Guard: AST Static Analysis & Conflict Attribution Te
     expect(marker.source).toBe('Semantic Guard')
   })
 })
+
+describe('Phase 3: Compiler Correctness Test Matrix (14 Scenarios)', () => {
+  it('1. Valid TypeScript with standard library types (Record, Partial, Readonly, Promise, Date, Error, Uint8Array)', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      {
+        id: 'f-std',
+        name: 'std.ts',
+        content: `
+          type User = { id: string; name: string };
+          const partialUser: Partial<User> = { id: '1' };
+          const map: Record<string, number> = { a: 1 };
+          const now: string = new Date().toISOString();
+          const err: Error = new Error('test');
+          const buf: Uint8Array = new Uint8Array(8);
+          async function fetchVal(): Promise<number> { return 42; }
+        `,
+      },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-1',
+      version: 1,
+      activeFileId: 'f-std',
+      files,
+    })
+    expect(raw.length).toBe(0)
+  })
+
+  it('2. Valid TSX and JSX syntax in .tsx and .jsx files', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      {
+        id: 'f-ui',
+        name: 'Component.tsx',
+        content: `
+          export function Component(props: { title: string }) {
+            return <div className="card"><h1>{props.title}</h1></div>;
+          }
+        `,
+      },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-2',
+      version: 1,
+      activeFileId: 'f-ui',
+      files,
+    })
+    expect(raw.length).toBe(0)
+  })
+
+  it('3. Extensionless relative imports (./math resolves math.ts)', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'f-math', name: 'math.ts', content: `export const PI = 3.14159;` },
+      { id: 'f-main', name: 'main.ts', content: `import { PI } from './math'; console.log(PI);` },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-3',
+      version: 1,
+      activeFileId: 'f-main',
+      files,
+    })
+    expect(raw.length).toBe(0)
+  })
+
+  it('4. Nested relative imports (../../core/util resolves across subdirectories)', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'f-core', name: 'core/util.ts', content: `export function add(a: number, b: number): number { return a + b; }` },
+      { id: 'f-btn', name: 'components/ui/Button.tsx', content: `import { add } from '../../core/util'; export const val = add(1, 2);` },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-4',
+      version: 1,
+      activeFileId: 'f-btn',
+      files,
+    })
+    expect(raw.length).toBe(0)
+  })
+
+  it('5. Same-named files in different directories do not collide', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'f-adm', name: 'admin/user.ts', content: `export const role = 'admin';` },
+      { id: 'f-cli', name: 'client/user.ts', content: `export const role = 'client';` },
+      { id: 'f-idx', name: 'index.ts', content: `
+        import { role as adminRole } from './admin/user';
+        import { role as clientRole } from './client/user';
+        console.log(adminRole, clientRole);
+      ` },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-5',
+      version: 1,
+      activeFileId: 'f-idx',
+      files,
+    })
+    expect(raw.length).toBe(0)
+  })
+
+  it('6. Missing modules emit TS2307 diagnostic', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'f-app', name: 'app.ts', content: `import { nonexistent } from './missing';` },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-6',
+      version: 1,
+      activeFileId: 'f-app',
+      files,
+    })
+    expect(raw.some((d) => d.code === 2307)).toBe(true)
+  })
+
+  it('7. Renamed files with stale imports emit TS2307 diagnostic', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'f-new', name: 'newService.ts', content: `export const service = 1;` },
+      { id: 'f-app', name: 'app.ts', content: `import { service } from './oldService';` },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-7',
+      version: 1,
+      activeFileId: 'f-app',
+      files,
+    })
+    expect(raw.some((d) => d.code === 2307)).toBe(true)
+  })
+
+  it('8. Deleted files still referenced elsewhere emit TS2307 diagnostic', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'f-app', name: 'app.ts', content: `import { deleted } from './deletedFile';` },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-8',
+      version: 1,
+      activeFileId: 'f-app',
+      files,
+    })
+    expect(raw.some((d) => d.code === 2307)).toBe(true)
+  })
+
+  it('9. Exported and imported symbols caught on type mismatch', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'f-data', name: 'data.ts', content: `export const count: number = 42;` },
+      { id: 'f-main', name: 'main.ts', content: `import { count } from './data'; const s: string = count;` },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-9',
+      version: 1,
+      activeFileId: 'f-main',
+      files,
+    })
+    expect(raw.some((d) => d.code === 2322)).toBe(true)
+  })
+
+  it('10. Incomplete code during typing emits static syntax diagnostic without crash', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'f-main', name: 'main.ts', content: `const x = ` },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-10',
+      version: 1,
+      activeFileId: 'f-main',
+      files,
+    })
+    expect(raw.length).toBeGreaterThan(0)
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(raw)
+    expect(attributed[0].category).toBe('SYNTAX_ERROR')
+    expect(attributed[0].attribution.isConcurrentConflict).toBe(false)
+  })
+
+  it('11. Repeated edits to the same document track version and updates diagnostics', () => {
+    const p = new SemanticGuardPipeline(new LocalAnalysisWorker(), 0)
+    const f1 = [{ id: 'doc', name: 'doc.ts', content: `const a: number = 'err';` }]
+    const res1 = p.triggerAnalysis('doc', f1)
+    expect(res1.version).toBe(1)
+
+    const f2 = [{ id: 'doc', name: 'doc.ts', content: `const a: number = 100;` }]
+    const res2 = p.triggerAnalysis('doc', f2)
+    expect(res2.version).toBe(2)
+    p.dispose()
+  })
+
+  it('12. Corrected errors clearing their old markers in Monaco', async () => {
+    const p = new SemanticGuardPipeline(new LocalAnalysisWorker(), 0)
+    let currentMarkers: any[] = []
+    const fakeMonaco = {
+      editor: {
+        setModelMarkers: (_m: any, _owner: string, markers: any[]) => {
+          currentMarkers = markers
+        },
+      },
+    }
+    p.bindMonaco(fakeMonaco, { uri: 'file:///workspace/doc.ts' })
+
+    await p.analyzeNow('doc', [{ id: 'doc', name: 'doc.ts', content: `const x: number = 'wrong';` }])
+    expect(currentMarkers.length).toBeGreaterThan(0)
+
+    await p.analyzeNow('doc', [{ id: 'doc', name: 'doc.ts', content: `const x: number = 42;` }])
+    expect(currentMarkers.length).toBe(0)
+    p.dispose()
+  })
+
+  it('13. Unsupported language extensions (.md, .json) are handled gracefully without compiler errors', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'f-md', name: 'README.md', content: `# Title\n\nSome documentation.` },
+      { id: 'f-json', name: 'config.json', content: `{"key": "value"}` },
+      { id: 'f-ts', name: 'main.ts', content: `export const val = 1;` },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-13',
+      version: 1,
+      activeFileId: 'f-ts',
+      files,
+    })
+    expect(raw.length).toBe(0)
+  })
+
+  it('14. Common ambient globals (console, setTimeout, setInterval, clearTimeout, Promise) do not cause false errors', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      {
+        id: 'f-amb',
+        name: 'ambient.ts',
+        content: `
+          console.log('test');
+          const timer = setTimeout(() => {}, 100);
+          clearTimeout(timer);
+          const interval = setInterval(() => {}, 200);
+          clearInterval(interval);
+        `,
+      },
+    ]
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'matrix-14',
+      version: 1,
+      activeFileId: 'f-amb',
+      files,
+    })
+    expect(raw.length).toBe(0)
+  })
+})
+
+describe('Phase 4: Adversarial Concurrent Conflict Attribution Matrix (10 Scenarios with Real Yjs Replicas)', () => {
+  it('1. Concurrent rename versus stale reference produces CONFIRMED_CONCURRENT_CONFLICT', () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const utilA = docA.getText('file:util')
+    const mainA = docA.getText('file:main')
+    const utilB = docB.getText('file:util')
+    const mainB = docB.getText('file:main')
+
+    utilA.insert(0, `export function processItem(): number { return 1; }\n`)
+    mainA.insert(0, `import { processItem } from './util';\n`)
+    syncReplicas(docA, docB)
+
+    // docA renames processItem -> handleItem
+    utilA.delete(16, 'processItem'.length)
+    utilA.insert(16, 'handleItem')
+
+    // docB concurrently invokes processItem()
+    mainB.insert(mainB.length, `processItem();\n`)
+
+    syncReplicas(docA, docB)
+
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-1',
+      version: 1,
+      activeFileId: 'main',
+      files: [
+        { id: 'util', name: 'util.ts', content: utilA.toString() },
+        { id: 'main', name: 'main.ts', content: mainA.toString() },
+      ],
+    })
+
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(raw, {
+      occurred: true,
+      sourceClientId: docA.clientID,
+      changedFileIds: ['util'],
+      mutatedDeclarations: ['processItem'],
+      targetSymbol: 'processItem',
+    })
+
+    const diag = attributed.find((d) => d.symbolName === 'processItem' || d.code === 2305)
+    expect(diag).toBeDefined()
+    expect(diag?.category).toBe('CONFIRMED_CONCURRENT_CONFLICT')
+  })
+
+  it('2. Concurrent deletion versus active reference produces CONFIRMED_CONCURRENT_CONFLICT', () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const apiA = docA.getText('file:api')
+    const clientA = docA.getText('file:client')
+    const apiB = docB.getText('file:api')
+    const clientB = docB.getText('file:client')
+
+    apiA.insert(0, `export function validateInput(): boolean { return true; }\n`)
+    clientA.insert(0, `import { validateInput } from './api';\n`)
+    syncReplicas(docA, docB)
+
+    // docA deletes validateInput
+    apiA.delete(0, apiA.length)
+    apiA.insert(0, `export const VERSION = 1;\n`)
+
+    // docB adds usage
+    clientB.insert(clientB.length, `const valid = validateInput();\n`)
+    syncReplicas(docA, docB)
+
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-2',
+      version: 1,
+      activeFileId: 'client',
+      files: [
+        { id: 'api', name: 'api.ts', content: apiA.toString() },
+        { id: 'client', name: 'client.ts', content: clientA.toString() },
+      ],
+    })
+
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(raw, {
+      occurred: true,
+      sourceClientId: docA.clientID,
+      changedFileIds: ['api'],
+      mutatedDeclarations: ['validateInput'],
+      targetSymbol: 'validateInput',
+    })
+
+    const diag = attributed.find((d) => d.symbolName === 'validateInput' || d.code === 2305)
+    expect(diag).toBeDefined()
+    expect(diag?.category).toBe('CONFIRMED_CONCURRENT_CONFLICT')
+  })
+
+  it('3. Concurrent duplicate declarations produce CONFIRMED_CONCURRENT_CONFLICT', () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const sharedA = docA.getText('file:shared')
+    const sharedB = docB.getText('file:shared')
+
+    sharedA.insert(0, `// shared file\n`)
+    syncReplicas(docA, docB)
+
+    // Both peers concurrently declare the same variable
+    sharedA.insert(sharedA.length, `export const configValue = 'fromA';\n`)
+    sharedB.insert(sharedB.length, `export const configValue = 'fromB';\n`)
+    syncReplicas(docA, docB)
+
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-3',
+      version: 1,
+      activeFileId: 'shared',
+      files: [{ id: 'shared', name: 'shared.ts', content: sharedA.toString() }],
+    })
+
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(raw, {
+      occurred: true,
+      sourceClientId: docB.clientID,
+      changedFileIds: ['shared'],
+      declaredSymbols: ['configValue'],
+      targetSymbol: 'configValue',
+    })
+
+    const dupDiag = attributed.find((d) => d.code === 2451 || d.code === 2300 || d.symbolName === 'configValue')
+    expect(dupDiag).toBeDefined()
+    expect(dupDiag?.category).toBe('CONFIRMED_CONCURRENT_CONFLICT')
+  })
+
+  it('4. Compatible concurrent edits result in 0 diagnostics', () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const mathA = docA.getText('file:math')
+    const mathB = docB.getText('file:math')
+
+    mathA.insert(0, `export function f1(): number { return 1; }\nexport function f2(): number { return 2; }\n`)
+    syncReplicas(docA, docB)
+
+    // docA modifies f1
+    const idx1 = mathA.toString().indexOf('return 1;') + 'return '.length
+    mathA.delete(idx1, 1)
+    mathA.insert(idx1, '10')
+
+    // docB modifies f2
+    const idx2 = mathB.toString().indexOf('return 2;') + 'return '.length
+    mathB.delete(idx2, 1)
+    mathB.insert(idx2, '20')
+    syncReplicas(docA, docB)
+
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-4',
+      version: 1,
+      activeFileId: 'math',
+      files: [{ id: 'math', name: 'math.ts', content: mathA.toString() }],
+    })
+
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(raw, {
+      occurred: true,
+      sourceClientId: docB.clientID,
+    })
+    expect(attributed.length).toBe(0)
+  })
+
+  it('5. A local error followed by an unrelated remote edit preserves STATIC_DIAGNOSTIC classification', () => {
+    // Local user introduces an error in main.ts
+    const localFiles: WorkspaceFileSnapshot[] = [
+      { id: 'main', name: 'main.ts', content: `const x: number = 'type-error';` },
+      { id: 'other', name: 'other.ts', content: `export const val = 1;` },
+    ]
+
+    const baselineRaw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-5-base',
+      version: 1,
+      activeFileId: 'main',
+      files: localFiles,
+    })
+    const baselineDiagnostics = ConflictAttributionEngine.attributeDiagnostics(baselineRaw)
+    expect(baselineDiagnostics[0].category).toBe('STATIC_DIAGNOSTIC')
+
+    // Remote peer then edits 'other.ts'
+    const updatedFiles: WorkspaceFileSnapshot[] = [
+      { id: 'main', name: 'main.ts', content: `const x: number = 'type-error';` },
+      { id: 'other', name: 'other.ts', content: `export const val = 200;` },
+    ]
+
+    const postMergeRaw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-5-post',
+      version: 2,
+      activeFileId: 'main',
+      files: updatedFiles,
+    })
+
+    // Remote merge occurred on 'other.ts', but error is in 'main.ts'
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(
+      postMergeRaw,
+      {
+        occurred: true,
+        sourceClientId: 999,
+        changedFileIds: ['other'],
+      },
+      baselineDiagnostics
+    )
+
+    const diag = attributed.find((d) => d.code === 2322)
+    expect(diag).toBeDefined()
+    // MUST remain STATIC_DIAGNOSTIC!
+    expect(diag?.category).toBe('STATIC_DIAGNOSTIC')
+    expect(diag?.attribution.isConcurrentConflict).toBe(false)
+  })
+
+  it('6. A causally ordered rename and reference update produces 0 diagnostics', () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const utilA = docA.getText('file:util')
+    const mainA = docA.getText('file:main')
+
+    // Peer A updates both declaration and reference in causal order
+    utilA.insert(0, `export function newFunction(): string { return 'ok'; }\n`)
+    mainA.insert(0, `import { newFunction } from './util'; console.log(newFunction());\n`)
+    syncReplicas(docA, docB)
+
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-6',
+      version: 1,
+      activeFileId: 'main',
+      files: [
+        { id: 'util', name: 'util.ts', content: utilA.toString() },
+        { id: 'main', name: 'main.ts', content: mainA.toString() },
+      ],
+    })
+
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(raw, {
+      occurred: true,
+      sourceClientId: docA.clientID,
+    })
+    expect(attributed.length).toBe(0)
+  })
+
+  it('7. An unrelated remote edit followed by a local error preserves STATIC_DIAGNOSTIC', () => {
+    // Unrelated remote edit occurred on file 'other'
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'main', name: 'main.ts', content: `const invalidType: number = 'not-a-number';` },
+      { id: 'other', name: 'other.ts', content: `export const X = 10;` },
+    ]
+
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-7',
+      version: 1,
+      activeFileId: 'main',
+      files,
+    })
+
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(raw, {
+      occurred: true,
+      sourceClientId: 777,
+      changedFileIds: ['other'], // Remote peer edited 'other', not 'main'
+    })
+
+    const diag = attributed[0]
+    expect(diag).toBeDefined()
+    expect(diag.category).toBe('STATIC_DIAGNOSTIC')
+    expect(diag.attribution.isConcurrentConflict).toBe(false)
+  })
+
+  it('8. Reconnection after multiple offline edits flags confirmed conflict for affected symbols', () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const schemaA = docA.getText('file:schema')
+    const consumerA = docA.getText('file:consumer')
+    const schemaB = docB.getText('file:schema')
+    const consumerB = docB.getText('file:consumer')
+
+    schemaA.insert(0, `export type UserProfile = { id: string; name: string };\n`)
+    consumerA.insert(0, `import { UserProfile } from './schema';\n`)
+    syncReplicas(docA, docB)
+
+    // docA offline: multiple sequential edits
+    schemaA.delete(12, 'UserProfile'.length)
+    schemaA.insert(12, 'AccountProfile')
+
+    // docB offline: multiple sequential edits referencing UserProfile
+    consumerB.insert(consumerB.length, `const user: UserProfile = { id: '1', name: 'Ada' };\n`)
+
+    // Partition heals: sync replicas
+    syncReplicas(docA, docB)
+
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-8',
+      version: 1,
+      activeFileId: 'consumer',
+      files: [
+        { id: 'schema', name: 'schema.ts', content: schemaA.toString() },
+        { id: 'consumer', name: 'consumer.ts', content: consumerA.toString() },
+      ],
+    })
+
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(raw, {
+      occurred: true,
+      sourceClientId: docA.clientID,
+      changedFileIds: ['schema'],
+      mutatedDeclarations: ['UserProfile'],
+      targetSymbol: 'UserProfile',
+    })
+
+    const conflict = attributed.find((d) => d.symbolName === 'UserProfile' || d.code === 2305)
+    expect(conflict).toBeDefined()
+    expect(conflict?.category).toBe('CONFIRMED_CONCURRENT_CONFLICT')
+  })
+
+  it('9. Stale provenance after an error has been fixed does not produce ghost conflict', async () => {
+    const pipeline = new SemanticGuardPipeline(new LocalAnalysisWorker(), 0)
+
+    // Phase A: Remote merge introduces conflict
+    pipeline.recordMergeEvent({
+      occurred: true,
+      sourceClientId: 999,
+      changedFileIds: ['api'],
+      mutatedDeclarations: ['oldFunc'],
+      targetSymbol: 'oldFunc',
+    })
+
+    const brokenFiles: WorkspaceFileSnapshot[] = [
+      { id: 'api', name: 'api.ts', content: `export function newFunc() {}\n` },
+      { id: 'main', name: 'main.ts', content: `import { oldFunc } from './api'; oldFunc();\n` },
+    ]
+
+    const resA = await pipeline.analyzeNow('main', brokenFiles)
+    const conflict = resA.diagnostics.find((d) => d.category === 'CONFIRMED_CONCURRENT_CONFLICT')
+    expect(conflict).toBeDefined()
+
+    // Phase B: User fixes main.ts to import newFunc
+    const fixedFiles: WorkspaceFileSnapshot[] = [
+      { id: 'api', name: 'api.ts', content: `export function newFunc() {}\n` },
+      { id: 'main', name: 'main.ts', content: `import { newFunc } from './api'; newFunc();\n` },
+    ]
+
+    const resB = await pipeline.analyzeNow('main', fixedFiles)
+    expect(resB.diagnostics.length).toBe(0)
+    pipeline.dispose()
+  })
+
+  it('10. Multiple diagnostics in one file: distinguishes CONCURRENT_CONFLICT from local STATIC_DIAGNOSTIC', () => {
+    const files: WorkspaceFileSnapshot[] = [
+      { id: 'api', name: 'api.ts', content: `export function renamedService(): void {}\n` },
+      {
+        id: 'main',
+        name: 'main.ts',
+        content: `
+          import { staleService } from './api';
+          staleService();
+          const localTypo: number = 'this is a local type mismatch';
+        `,
+      },
+    ]
+
+    const raw = SemanticChecker.checkWorkspace({
+      requestId: 'adv-10',
+      version: 1,
+      activeFileId: 'main',
+      files,
+    })
+
+    const attributed = ConflictAttributionEngine.attributeDiagnostics(raw, {
+      occurred: true,
+      sourceClientId: 888,
+      changedFileIds: ['api'],
+      mutatedDeclarations: ['staleService'],
+      targetSymbol: 'staleService',
+    })
+
+    const conflictDiag = attributed.find((d) => d.symbolName === 'staleService' || d.code === 2305)
+    const staticDiag = attributed.find((d) => d.code === 2322)
+
+    expect(conflictDiag).toBeDefined()
+    expect(conflictDiag?.category).toBe('CONFIRMED_CONCURRENT_CONFLICT')
+
+    expect(staticDiag).toBeDefined()
+    expect(staticDiag?.category).toBe('STATIC_DIAGNOSTIC')
+  })
+})

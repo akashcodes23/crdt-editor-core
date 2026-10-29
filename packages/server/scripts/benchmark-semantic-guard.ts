@@ -46,8 +46,8 @@ async function runBenchmarks() {
     content: `export class VectorClock { constructor(public id: string) {} tick(): void {} }`,
   }
 
-  // ── Benchmark 1: Analysis Duration across Small, Medium, Large Files ─────
-  console.log('\n## Benchmark 1: AST Analysis Duration Across Workload Sizes')
+  // ── Benchmark 1: Compiler Cold Start vs Incremental Analysis Duration ───
+  console.log('\n## Benchmark 1: Compiler Cold Start vs Incremental Analysis Duration')
 
   const workloads = [
     { name: 'Small File (~25 lines / ~1 KB)', lines: 25 },
@@ -64,6 +64,22 @@ async function runBenchmarks() {
       { id: 'target', name: 'target.ts', content },
     ]
 
+    // Cold start measurement (first execution without warm-up)
+    const coldStart = performance.now()
+    const coldRaw = SemanticChecker.checkWorkspace({
+      requestId: 'cold',
+      version: 0,
+      activeFileId: 'target',
+      files,
+    })
+    ConflictAttributionEngine.attributeDiagnostics(coldRaw, {
+      occurred: true,
+      sourceClientId: 99,
+      mutatedDeclarations: ['calculateMissingTotal'],
+      targetSymbol: 'calculateMissingTotal',
+    })
+    const coldDurationMs = performance.now() - coldStart
+
     // Warm-up 5 cycles
     for (let i = 0; i < 5; i++) {
       SemanticChecker.checkWorkspace({
@@ -74,7 +90,7 @@ async function runBenchmarks() {
       })
     }
 
-    // Measure 30 iterations
+    // Measure 30 incremental iterations (main-thread synchronous execution time)
     const samples: number[] = []
     for (let i = 0; i < 30; i++) {
       const start = performance.now()
@@ -104,18 +120,66 @@ async function runBenchmarks() {
       workload: wl.name,
       lines: wl.lines,
       fileSizeChars: content.length,
+      coldStartMs: coldDurationMs.toFixed(2),
       meanDurationMs: mean.toFixed(2),
       medianDurationMs: median.toFixed(2),
       p95DurationMs: p95.toFixed(2),
+      mainThreadBlocking: 'Synchronous (Main Thread)',
     })
   }
 
   console.table(workloadResults)
 
-  // ── Benchmark 2: Time to Update Diagnostics After Edit ───────────────────
-  console.log('\n## Benchmark 2: End-to-End Diagnostic Update Latency')
+  // ── Benchmark 2: Multi-File Workspace Analysis Cost (10 Files) ────────────
+  console.log('\n## Benchmark 2: Multi-File Workspace Cross-File Analysis Cost (10 files)')
+  const multiFiles: WorkspaceFileSnapshot[] = [helperFile]
+  for (let f = 1; f <= 9; f++) {
+    multiFiles.push({
+      id: `file_${f}`,
+      name: `module_${f}.ts`,
+      content: `
+        import { VectorClock } from './vectorClock';
+        export class Module_${f} {
+          private vc = new VectorClock('mod_${f}');
+          public compute(n: number): number { return n * ${f}; }
+        }
+      `,
+    })
+  }
+  // Target file imports from all 9 modules
+  multiFiles.push({
+    id: 'aggregator',
+    name: 'aggregator.ts',
+    content: `
+      ${Array.from({ length: 9 }, (_, idx) => `import { Module_${idx + 1} } from './module_${idx + 1}';`).join('\n')}
+      export function runAll(): number {
+        return ${Array.from({ length: 9 }, (_, idx) => `new Module_${idx + 1}().compute(${idx})`).join(' + ')};
+      }
+    `,
+  })
 
-  const scheduler = new DebouncedAnalysisScheduler(new LocalAnalysisWorker(), 0) // immediate flush
+  // Measure 20 runs
+  const multiSamples: number[] = []
+  for (let i = 0; i < 20; i++) {
+    const t0 = performance.now()
+    SemanticChecker.checkWorkspace({
+      requestId: `multi-${i}`,
+      version: i + 1,
+      activeFileId: 'aggregator',
+      files: multiFiles,
+    })
+    multiSamples.push(performance.now() - t0)
+  }
+  multiSamples.sort((a, b) => a - b)
+  const multiMedian = multiSamples[Math.floor(multiSamples.length / 2)].toFixed(2)
+  const multiP95 = multiSamples[Math.floor(multiSamples.length * 0.95)].toFixed(2)
+  console.log(`10-File Workspace Analysis Latency:`)
+  console.log(`Median: ${multiMedian} ms | P95: ${multiP95} ms`)
+
+  // ── Benchmark 3: End-to-End Edit-to-Marker Latency (with Debounce Breakdown) ─
+  console.log('\n## Benchmark 3: End-to-End Diagnostic Update Latency & Debounce Breakdown')
+
+  const immediateScheduler = new DebouncedAnalysisScheduler(new LocalAnalysisWorker(), 0) // immediate flush
   const editLatencies: number[] = []
 
   for (let i = 0; i < 20; i++) {
@@ -124,9 +188,9 @@ async function runBenchmarks() {
 
     const start = performance.now()
     await new Promise<void>((resolve) => {
-      scheduler.schedule(
+      immediateScheduler.schedule(
         { activeFileId: 'edit', files },
-        (res) => {
+        () => {
           editLatencies.push(performance.now() - start)
           resolve()
         }
@@ -139,17 +203,28 @@ async function runBenchmarks() {
   const editMedian = editLatencies[Math.floor(editLatencies.length / 2)].toFixed(2)
   const editP95 = editLatencies[Math.floor(editLatencies.length * 0.95)].toFixed(2)
 
-  console.log(`Edit Diagnostic Update Latency (20 edits):`)
+  console.log(`Immediate (0ms debounce) Edit Update Latency (20 edits):`)
   console.log(`Mean:   ${editMean} ms`)
   console.log(`Median: ${editMedian} ms`)
   console.log(`P95:    ${editP95} ms`)
+  console.log(`Default debounce configured in editor: 200 ms`)
+  console.log(`Expected End-to-End latency in production editor: ~${(Number(editMedian) + 200).toFixed(2)} ms`)
 
-  // ── Benchmark 3: Worker Cancellation & Stale Result Throughput ───────────
-  console.log('\n## Benchmark 3: Burst Typing Debounce & Stale Work Cancellation')
+  // ── Benchmark 4: Worker Cancellation & Actual Compiler Invocations ────────
+  console.log('\n## Benchmark 4: Burst Typing Debounce & Actual Compiler Invocations')
 
-  const burstScheduler = new DebouncedAnalysisScheduler(new LocalAnalysisWorker(), 50)
+  let actualCompilerInvocations = 0
+  const instrumentedWorker = {
+    analyze: async (req: any) => {
+      actualCompilerInvocations++
+      const worker = new LocalAnalysisWorker()
+      return worker.analyze(req)
+    },
+    dispose: () => {},
+  }
+
+  const burstScheduler = new DebouncedAnalysisScheduler(instrumentedWorker, 50)
   let deliveredResults = 0
-  let cancelledRequests = 0
 
   // Simulate rapid 50ms keystroke burst (10 rapid keystrokes within 20ms)
   const totalKeystrokes = 10
@@ -167,11 +242,12 @@ async function runBenchmarks() {
 
   // Wait for debounce to settle
   await new Promise((r) => setTimeout(r, 120))
-  cancelledRequests = totalKeystrokes - deliveredResults
+  const supersededExecutions = totalKeystrokes - actualCompilerInvocations
 
-  console.log(`Burst Keystrokes Simulated:  ${totalKeystrokes}`)
-  console.log(`Delivered Final Analysis:    ${deliveredResults}`)
-  console.log(`Superseded / Cancelled Work: ${cancelledRequests} (${((cancelledRequests / totalKeystrokes) * 100).toFixed(1)}% reduction in analysis executions)`)
+  console.log(`Burst Keystrokes Simulated:        ${totalKeystrokes}`)
+  console.log(`Delivered Final Analysis:          ${deliveredResults}`)
+  console.log(`Actual Compiler Executions:        ${actualCompilerInvocations}`)
+  console.log(`Superseded / Avoided Compiles:     ${supersededExecutions} (${((supersededExecutions / totalKeystrokes) * 100).toFixed(1)}% verified reduction in actual compiler invocations)`)
 
   console.log('\n' + '='.repeat(80))
   console.log('SEMANTIC GUARD BENCHMARK COMPLETE')

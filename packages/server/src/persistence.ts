@@ -19,19 +19,43 @@ interface LeveldbPersistenceConstructor {
 // ── Singleton ─────────────────────────────────────────────────────────────────
 const DB_DIR = path.resolve(process.cwd(), 'data', 'leveldb')
 
-let _ldb: LeveldbPersistenceInstance | null = null
+declare global {
+  // eslint-disable-next-line no-var
+  var __converge_leveldb__: LeveldbPersistenceInstance | null | undefined
+  // eslint-disable-next-line no-var
+  var __converge_persistence__: Persistence | null | undefined
+}
 
 function getLeveldb(): LeveldbPersistenceInstance {
-  if (_ldb) return _ldb
-  fs.mkdirSync(DB_DIR, { recursive: true })
-  // y-leveldb is CJS-only with no type declarations — dynamic require is intentional.
+  if (globalThis.__converge_leveldb__) return globalThis.__converge_leveldb__
+  const dbDir = process.env.LEVELDB_DIR || DB_DIR
+  fs.mkdirSync(dbDir, { recursive: true })
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { LeveldbPersistence } = require('y-leveldb') as {
-    LeveldbPersistence: LeveldbPersistenceConstructor
+  const { LeveldbPersistence } = require('y-leveldb')
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const level = require('level')
+  const customLevel = (loc: string, opts: any) => {
+    const db = level(loc, opts)
+    if (db && typeof db.on === 'function') {
+      db.on('error', (err: any) => {
+        console.warn('[persistence] LevelDB instance error handled:', err?.message || err)
+      })
+    }
+    return db
   }
-  _ldb = new LeveldbPersistence(DB_DIR)
-  console.log(`[persistence] LevelDB opened at ${DB_DIR}`)
-  return _ldb
+  const ldb = new LeveldbPersistence(dbDir, { level: customLevel }) as LeveldbPersistenceInstance
+  console.log(`[persistence] LevelDB opened at ${dbDir}`)
+  globalThis.__converge_leveldb__ = ldb
+  return ldb
+}
+
+export async function closePersistence(): Promise<void> {
+  const ldb = globalThis.__converge_leveldb__
+  if (ldb && typeof (ldb as any).destroy === 'function') {
+    await (ldb as any).destroy()
+    globalThis.__converge_leveldb__ = null
+  }
+  globalThis.__converge_persistence__ = null
 }
 
 // ── Public persistence interface expected by room.ts ──────────────────────────
@@ -42,10 +66,21 @@ export interface Persistence {
    * updates so every change is flushed to disk automatically.
    */
   bindState(docName: string, ydoc: Y.Doc): Promise<void>
+  /**
+   * Flushes any in-flight LevelDB writes for docName.
+   */
+  flushDocument(docName: string): Promise<void>
+  /**
+   * Directly stores a single update to LevelDB and awaits completion.
+   */
+  storeUpdate(docName: string, update: Uint8Array): Promise<void>
 }
 
+const leveldbWriteQueues = new Map<string, Promise<void>>()
+
 export function getPersistence(): Persistence {
-  return {
+  if (globalThis.__converge_persistence__) return globalThis.__converge_persistence__
+  const instance: Persistence = {
     async bindState(docName: string, ydoc: Y.Doc): Promise<void> {
       const ldb = getLeveldb()
 
@@ -63,11 +98,36 @@ export function getPersistence(): Persistence {
 
       // 4. Subscribe so every future incremental update is persisted immediately
       ydoc.on('update', (update: Uint8Array, origin: any) => {
-        if (origin === 'leveldb-restore') return
-        ldb.storeUpdate(docName, update).catch((err: unknown) => {
+        if (origin === 'leveldb-restore' || origin === 'durable-apply' || origin === 'postgres-reconcile') return
+        const writePromise = ldb.storeUpdate(docName, update).catch((err: unknown) => {
           console.error(`[persistence] storeUpdate failed for "${docName}":`, err)
         })
+        const queue = leveldbWriteQueues.get(docName) || Promise.resolve()
+        leveldbWriteQueues.set(
+          docName,
+          queue.then(() => writePromise)
+        )
       })
     },
+
+    async storeUpdate(docName: string, update: Uint8Array): Promise<void> {
+      const ldb = getLeveldb()
+      const writePromise = ldb.storeUpdate(docName, update)
+      const queue = leveldbWriteQueues.get(docName) || Promise.resolve()
+      leveldbWriteQueues.set(
+        docName,
+        queue.then(() => writePromise)
+      )
+      await writePromise
+    },
+
+    async flushDocument(docName: string): Promise<void> {
+      const queue = leveldbWriteQueues.get(docName)
+      if (queue) {
+        await queue
+      }
+    },
   }
+  globalThis.__converge_persistence__ = instance
+  return instance
 }

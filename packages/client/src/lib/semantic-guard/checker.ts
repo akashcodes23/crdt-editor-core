@@ -23,6 +23,20 @@ export interface RawDiagnostic {
   symbolName?: string
 }
 
+function normalizePosixPath(baseDir: string, relativePath: string): string {
+  const parts = (baseDir.replace(/\/$/, '') + '/' + relativePath).split('/')
+  const resolved: string[] = []
+  for (const part of parts) {
+    if (!part || part === '.') continue
+    if (part === '..') {
+      if (resolved.length > 0) resolved.pop()
+    } else {
+      resolved.push(part)
+    }
+  }
+  return '/' + resolved.join('/')
+}
+
 export class SemanticChecker {
   private static readonly LIB_FILE_NAME = '/lib.d.ts'
 
@@ -35,10 +49,13 @@ export class SemanticChecker {
 
     // Index all workspace files by virtual path
     for (const f of request.files) {
-      const vPath = `/workspace/${f.name}`
+      const relPath = (f as any).path || f.name
+      const cleanPath = relPath.startsWith('/') ? relPath.slice(1) : relPath
+      const vPath = `/workspace/${cleanPath}`
       fileMap.set(vPath, f)
       pathToFileId.set(vPath, f.id)
       pathToFileId.set(f.name, f.id)
+      pathToFileId.set(f.id, f.id)
     }
 
     const host: ts.CompilerHost = {
@@ -67,18 +84,17 @@ export class SemanticChecker {
         return fileMap.get(fileName)?.content
       },
       resolveModuleNames: (moduleNames: string[], containingFile: string) => {
+        const containingDir = containingFile.substring(0, containingFile.lastIndexOf('/'))
         return moduleNames.map((modName) => {
-          let candidate = modName
-          if (candidate.startsWith('./') || candidate.startsWith('../')) {
-            const clean = candidate.replace(/^\.\//, '')
-            // Check possible extensions
-            const extensions = ['.ts', '.tsx', '.js', '.jsx', '']
+          if (modName.startsWith('./') || modName.startsWith('../')) {
+            const basePath = normalizePosixPath(containingDir, modName)
+            const extensions = ['.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.tsx', '']
             for (const ext of extensions) {
-              const testPath = `/workspace/${clean}${ext}`
+              const testPath = `${basePath}${ext}`
               if (fileMap.has(testPath)) {
                 return {
                   resolvedFileName: testPath,
-                  extension: ts.Extension.Ts,
+                  extension: testPath.endsWith('.tsx') || testPath.endsWith('.jsx') ? ts.Extension.Tsx : ts.Extension.Ts,
                   isExternalLibraryImport: false,
                 }
               }
@@ -89,13 +105,15 @@ export class SemanticChecker {
       },
     }
 
-    const rootNames = Array.from(fileMap.keys())
+    // Only compile supported languages (TypeScript & JavaScript)
+    const rootNames = Array.from(fileMap.keys()).filter((p) => /\.(tsx?|jsx?)$/.test(p))
     if (rootNames.length === 0) return []
 
     const compilerOptions: ts.CompilerOptions = {
       target: ts.ScriptTarget.ES2022,
       module: ts.ModuleKind.ESNext,
       moduleResolution: ts.ModuleResolutionKind.Bundler,
+      jsx: ts.JsxEmit.React,
       allowJs: true,
       noEmit: true,
       skipLibCheck: true,

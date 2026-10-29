@@ -1,6 +1,7 @@
 'use client'
 
 import type { ConnectionStatus, ChaosState } from '@/hooks/useYDoc'
+import type { SaveState } from '@/lib/durable-client'
 
 interface ConnectionStatusBadgeProps {
   status: ConnectionStatus
@@ -9,6 +10,8 @@ interface ConnectionStatusBadgeProps {
   onReconnect: () => void
   onStartChaos: () => void
   label: string
+  saveState?: SaveState
+  onRetryFailed?: () => void
 }
 
 /** Circumference for r=12: 2π×12 ≈ 75.4 */
@@ -21,6 +24,8 @@ export function ConnectionStatusBadge({
   onReconnect,
   onStartChaos,
   label,
+  saveState,
+  onRetryFailed,
 }: ConnectionStatusBadgeProps) {
   const slug       = label.toLowerCase().replace(/\s+/g, '-')
   const isOnline   = status === 'connected'
@@ -31,10 +36,43 @@ export function ConnectionStatusBadge({
       {/* Animated status dot */}
       <div className={`conn-dot conn-dot--${status}`} />
 
-      {/* Status pill */}
+      {/* Transport status pill */}
       <span className={`conn-pill conn-pill--${status}`}>
         {isOnline ? 'Online' : status === 'connecting' ? 'Connecting…' : 'Offline'}
       </span>
+
+      {/* Persistence status pill */}
+      {saveState && (
+        <span
+          className={`save-pill save-pill--${saveState.overallStatus}`}
+          title={
+            saveState.overallStatus === 'durable'
+              ? `All ${saveState.durableCount} updates persisted${saveState.latestConfirmedHlc ? ` (HLC: ${saveState.latestConfirmedHlc})` : ''}`
+              : saveState.overallStatus === 'pending'
+              ? `${saveState.pendingCount} update(s) in-flight awaiting durable confirmation`
+              : saveState.overallStatus === 'unknown'
+              ? `${saveState.unknownCount} update(s) unconfirmed (connection dropped)`
+              : `${saveState.failedCount} update(s) failed persistence`
+          }
+        >
+          {saveState.overallStatus === 'durable' && '✓ Saved'}
+          {saveState.overallStatus === 'pending' && `Saving (${saveState.pendingCount})…`}
+          {saveState.overallStatus === 'unknown' && `Unconfirmed (${saveState.unknownCount})`}
+          {saveState.overallStatus === 'failed' && `Save Failed (${saveState.failedCount})`}
+        </span>
+      )}
+
+      {/* Manual retry save button if there are failed or unconfirmed updates while online */}
+      {isOnline && onRetryFailed && saveState && (saveState.failedCount > 0 || saveState.unknownCount > 0) && (
+        <button
+          id={`btn-retry-save-${slug}`}
+          className="conn-btn conn-btn--retry-save"
+          onClick={onRetryFailed}
+          title="Retry persisting unconfirmed or failed updates"
+        >
+          ↻ Retry Save
+        </button>
+      )}
 
       {/* Chaos countdown ring */}
       {chaos.active && (

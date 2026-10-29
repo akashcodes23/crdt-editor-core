@@ -14,6 +14,7 @@ import {
 } from './types'
 import { SemanticChecker } from './checker'
 import { ConflictAttributionEngine } from './attribution'
+import { WebWorkerAnalysisWorker } from './worker-client'
 
 export class LocalAnalysisWorker implements IAnalysisWorker {
   public async analyze(request: AnalysisRequest): Promise<AnalysisResponse> {
@@ -22,7 +23,8 @@ export class LocalAnalysisWorker implements IAnalysisWorker {
       const raw = SemanticChecker.checkWorkspace(request)
       const diagnostics = ConflictAttributionEngine.attributeDiagnostics(
         raw,
-        request.provenance
+        request.provenance,
+        request.baselineDiagnostics
       )
       const duration = performance.now() - startTime
 
@@ -73,13 +75,16 @@ export class LocalAnalysisWorker implements IAnalysisWorker {
 
 export class DebouncedAnalysisScheduler {
   private timeoutId: any = null
-  private currentVersion: number = 0
-  private latestCompletedVersion: number = 0
+  private requestedVersion: number = 0
+  private executingVersion: number | null = null
+  private completedVersion: number = 0
+  private displayedVersion: number = 0
+  private activeRequestId: string | null = null
   private worker: IAnalysisWorker
   private debounceMs: number
 
   constructor(worker?: IAnalysisWorker, debounceMs: number = 200) {
-    this.worker = worker || new LocalAnalysisWorker()
+    this.worker = worker || new WebWorkerAnalysisWorker()
     this.debounceMs = debounceMs
   }
 
@@ -90,8 +95,8 @@ export class DebouncedAnalysisScheduler {
     requestData: Omit<AnalysisRequest, 'version' | 'requestId'>,
     onResult: (response: AnalysisResponse) => void
   ): { version: number; requestId: string } {
-    this.currentVersion++
-    const version = this.currentVersion
+    this.requestedVersion++
+    const version = this.requestedVersion
     const requestId = `req-${version}-${Date.now()}`
 
     this.cancelPending()
@@ -116,8 +121,8 @@ export class DebouncedAnalysisScheduler {
     requestData: Omit<AnalysisRequest, 'version' | 'requestId'>,
     onResult: (response: AnalysisResponse) => void
   ): Promise<AnalysisResponse> {
-    this.currentVersion++
-    const version = this.currentVersion
+    this.requestedVersion++
+    const version = this.requestedVersion
     const requestId = `req-immediate-${version}-${Date.now()}`
 
     this.cancelPending()
@@ -135,6 +140,9 @@ export class DebouncedAnalysisScheduler {
     request: AnalysisRequest,
     onResult: (response: AnalysisResponse) => void
   ): Promise<AnalysisResponse> {
+    this.executingVersion = request.version
+    this.activeRequestId = request.requestId
+
     let response: AnalysisResponse
     try {
       response = await this.worker.analyze(request)
@@ -167,15 +175,20 @@ export class DebouncedAnalysisScheduler {
         isStale: false,
         timestamp: Date.now(),
       }
+    } finally {
+      if (this.activeRequestId === request.requestId) {
+        this.executingVersion = null
+      }
     }
 
-    // Stale-result rejection: discard if document version has advanced
-    if (response.version < this.currentVersion) {
+    // Stale-result rejection: discard if newer version was requested or already completed
+    if (response.version < this.requestedVersion || response.version < this.completedVersion) {
       response.isStale = true
       return response
     }
 
-    this.latestCompletedVersion = response.version
+    this.completedVersion = response.version
+    this.displayedVersion = response.version
     onResult(response)
     return response
   }
@@ -185,14 +198,38 @@ export class DebouncedAnalysisScheduler {
       clearTimeout(this.timeoutId)
       this.timeoutId = null
     }
+
+    if (this.worker.cancel && this.activeRequestId && this.executingVersion !== null) {
+      this.worker.cancel(this.activeRequestId, this.executingVersion)
+    }
   }
 
   public getCurrentVersion(): number {
-    return this.currentVersion
+    return this.requestedVersion
+  }
+
+  public getRequestedVersion(): number {
+    return this.requestedVersion
+  }
+
+  public getExecutingVersion(): number | null {
+    return this.executingVersion
   }
 
   public getLatestCompletedVersion(): number {
-    return this.latestCompletedVersion
+    return this.completedVersion
+  }
+
+  public getCompletedVersion(): number {
+    return this.completedVersion
+  }
+
+  public getDisplayedVersion(): number {
+    return this.displayedVersion
+  }
+
+  public getWorker(): IAnalysisWorker {
+    return this.worker
   }
 
   public dispose(): void {
@@ -200,3 +237,4 @@ export class DebouncedAnalysisScheduler {
     this.worker.dispose()
   }
 }
+

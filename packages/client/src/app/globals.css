@@ -354,6 +354,22 @@ html, body {
 
 .conn-btn--disconnect { background: rgba(239,68,68,0.2); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
 .conn-btn--reconnect  { background: rgba(16,185,129,0.2); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+.conn-btn--retry-save { background: rgba(245,158,11,0.2); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+
+.save-pill {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 20px;
+  letter-spacing: 0.3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.save-pill--durable { background: rgba(59,130,246,0.15); color: #60a5fa; }
+.save-pill--pending { background: rgba(245,158,11,0.15); color: #fbbf24; }
+.save-pill--unknown { background: rgba(168,85,247,0.15); color: #c084fc; }
+.save-pill--failed  { background: rgba(239,68,68,0.2);  color: #f87171; }
 
 /* ══════════════════════════════════════════════════════════════════════
    VECTOR CLOCK SIDEBAR

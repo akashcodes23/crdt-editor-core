@@ -39,7 +39,7 @@ interface EditorPaneProps {
 
 export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) {
   const {
-    doc, provider, status,
+    doc, provider, status, saveState, retryFailedUpdates,
     disconnect, reconnect, startChaos,
     chaos, mergeFlashRange, clearMergeFlash, syncBytes,
   } = useYDoc(clientLabel)
@@ -159,6 +159,14 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
     }
   }, [doc, provider, monacoReady, activeFileId, nodes])
 
+  const activeFileIdRef = useRef<string | null>(activeFileId)
+  useEffect(() => {
+    activeFileIdRef.current = activeFileId
+    if (pipelineRef.current && activeFileId) {
+      setDiagnostics(pipelineRef.current.getDiagnostics(activeFileId))
+    }
+  }, [activeFileId])
+
   // ── Semantic Guard Pipeline Initialization & Merge Tracking ──────────────
   useEffect(() => {
     if (!doc) return
@@ -166,7 +174,7 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
     pipelineRef.current = pipeline
 
     pipeline.onUpdate((fileId, diags) => {
-      if (fileId === activeFileId || diags.length === 0) {
+      if (fileId === activeFileIdRef.current) {
         setDiagnostics(diags)
       }
     })
@@ -188,7 +196,7 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
       pipeline.dispose()
       pipelineRef.current = null
     }
-  }, [doc, activeFileId])
+  }, [doc])
 
   // Trigger analysis when active file, monaco model, or workspace nodes change
   useEffect(() => {
@@ -199,6 +207,7 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
     const monacoGlobal = (window as any).monaco
     if (model && monacoGlobal) {
       pipelineRef.current?.bindMonaco(monacoGlobal, model)
+      pipelineRef.current?.switchActiveFile(activeFileId, model)
     }
 
     const runAnalysis = () => {
@@ -215,9 +224,20 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
     runAnalysis()
 
     const yText = doc.getText(`file:${activeFileId}`)
-    yText.observe(runAnalysis)
+    const handleTextChange = (_event: any, transaction: any) => {
+      if (transaction && transaction.origin !== doc.clientID) {
+        pipelineRef.current?.recordMergeEvent({
+          occurred: true,
+          sourceClientId: typeof transaction.origin === 'number' ? transaction.origin : undefined,
+          changedFileIds: [activeFileId],
+        })
+      }
+      runAnalysis()
+    }
+
+    yText.observe(handleTextChange)
     return () => {
-      yText.unobserve(runAnalysis)
+      yText.unobserve(handleTextChange)
     }
   }, [doc, activeFileId, monacoReady, nodes])
 
@@ -373,6 +393,8 @@ export function EditorPane({ clientLabel, displayName, side }: EditorPaneProps) 
           onReconnect={reconnect}
           onStartChaos={startChaos}
           label={displayName}
+          saveState={saveState}
+          onRetryFailed={retryFailedUpdates}
         />
       </div>
 

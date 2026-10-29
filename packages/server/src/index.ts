@@ -2,16 +2,67 @@ import express from 'express'
 import http from 'http'
 import cors from 'cors'
 import { WebSocketServer } from 'ws'
-import { setupWSConnection, getRoom, flushRoomPersistence } from './room.js'
+import { setupWSConnection, getRoom, flushRoomPersistence, flushAllRooms, closeAllRooms, rooms } from './room.js'
 import { dbPool, initDb } from './db.js'
+import { closePersistence } from './persistence.js'
 import * as Y from 'yjs'
+import {
+  getSecurityConfig,
+  validateProductionSecurityConfig,
+  adminAuthMiddleware,
+  docAuthMiddleware,
+  isValidDocId,
+  isOriginAllowed,
+} from './security.js'
 
 const PORT = parseInt(process.env.PORT ?? '1234', 10)
 const HOST = process.env.HOST ?? '0.0.0.0'
 
+// Validate production security configuration before binding ports
+const secValidation = validateProductionSecurityConfig()
+if (!secValidation.valid) {
+  console.error('❌  FATAL SECURITY CONFIGURATION ERROR:')
+  for (const err of secValidation.errors) {
+    console.error(`   - ${err}`)
+  }
+  if (process.env.NODE_ENV === 'production') {
+    console.error('Server refusing to start in production with insecure configuration.')
+    process.exit(1)
+  }
+}
+
+const securityConfig = getSecurityConfig()
 const app = express()
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }))
+
+// Dynamic origin CORS check against allowlist
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      const check = isOriginAllowed(origin, securityConfig.allowedOrigins)
+      if (check.allowed) {
+        callback(null, true)
+      } else {
+        callback(new Error(`CORS policy violation: origin "${origin}" not allowed`))
+      }
+    },
+    credentials: true,
+  })
+)
 app.use(express.json())
+
+export let isShuttingDown = false
+
+// Reject new incoming requests during graceful shutdown
+app.use((req, res, next) => {
+  if (isShuttingDown && req.path !== '/health') {
+    res.status(503).json({
+      error: 'SERVER_SHUTTING_DOWN',
+      message: 'Server is shutting down; not accepting new requests.',
+    })
+    return
+  }
+  next()
+})
 
 // Health check with DB status
 app.get('/health', async (_req, res) => {
@@ -30,10 +81,16 @@ app.get('/health', async (_req, res) => {
   })
 })
 
-// Room info endpoint
+// Room info endpoint (Inspects active memory registry without allocating new rooms)
 app.get('/rooms/:name/info', (req, res) => {
   const roomName = req.params.name
-  const room = getRoom(roomName)
+  if (!isValidDocId(roomName)) {
+    return res.status(400).json({ error: 'INVALID_ROOM_NAME', message: 'Room name contains invalid characters or exceeds 128 chars' })
+  }
+  const room = rooms.get(roomName)
+  if (!room) {
+    return res.status(404).json({ error: 'ROOM_NOT_FOUND', message: `Room "${roomName}" is not currently active` })
+  }
   res.json({
     room: roomName,
     clientCount: room.clients.size,
@@ -42,7 +99,7 @@ app.get('/rooms/:name/info', (req, res) => {
 })
 
 // Time-Travel History endpoint with Bounded Snapshot-Assisted Recovery Contract
-app.get('/doc/:id/history', async (req, res) => {
+app.get('/doc/:id/history', docAuthMiddleware, async (req, res) => {
   try {
     const docId = req.params.id || 'demo'
     const beforeHLC = (req.query.before as string) || 'zzzzzzzzzzzz-zzzz-zzzz'
@@ -108,7 +165,7 @@ app.get('/doc/:id/history', async (req, res) => {
 })
 
 // Retention Status Endpoint (Reports exact retention boundary and metrics)
-app.get('/doc/:id/retention', async (req, res) => {
+app.get('/doc/:id/retention', docAuthMiddleware, async (req, res) => {
   try {
     const docId = req.params.id
     const snapshotStats = await dbPool.query(
@@ -150,7 +207,7 @@ app.get('/doc/:id/retention', async (req, res) => {
 })
 
 // Snapshot Trigger Endpoint (Captures document checkpoint synchronized with persistence)
-app.post('/doc/:id/snapshot', async (req, res) => {
+app.post('/doc/:id/snapshot', adminAuthMiddleware, async (req, res) => {
   try {
     const docId = req.params.id
     const room = getRoom(docId)
@@ -183,7 +240,7 @@ app.post('/doc/:id/snapshot', async (req, res) => {
 })
 
 // Transactional Log Compaction Endpoint (Checkpoint + Operation Pruning with Concurrency Lock)
-app.post('/doc/:id/compact', async (req, res) => {
+app.post('/doc/:id/compact', adminAuthMiddleware, async (req, res) => {
   const docId = req.params.id
   const room = getRoom(docId)
   await room.loadedPromise
@@ -216,6 +273,15 @@ app.post('/doc/:id/compact', async (req, res) => {
       return res.json({ success: true, message: 'No operations to compact', docId })
     }
 
+    // Verify there are actually uncompacted operations at or before cutoffHlc
+    const opCountRes = await client.query(
+      `SELECT COUNT(*) FROM operations WHERE doc_id = $1 AND hlc_timestamp <= $2`,
+      [docId, cutoffHlc]
+    )
+    if (parseInt(opCountRes.rows[0].count, 10) === 0) {
+      return res.json({ success: true, message: 'No operations to compact', docId, compactedOperations: 0 })
+    }
+
     // 3. Capture in-memory snapshot synchronously.
     // Node.js is single-threaded; because flushRoomPersistence completed and no await occurs
     // before taking the snapshot, the snapshot captures EXACTLY the document state through cutoffHlc.
@@ -246,7 +312,7 @@ app.post('/doc/:id/compact', async (req, res) => {
   } catch (err: any) {
     await client.query('ROLLBACK').catch(() => {})
     console.error('[http] compaction error:', err.message)
-    res.status(500).json({ error: 'Failed to execute compaction', details: err.message })
+    res.status(500).json({ error: 'COMPACTION_FAILED', message: 'Failed to execute compaction' })
   } finally {
     room.isCompacting = false
     client.release()
@@ -257,10 +323,37 @@ const server = http.createServer(app)
 
 const wss = new WebSocketServer({
   server,
-  maxPayload: 10 * 1024 * 1024, // 10MB limit
+  maxPayload: securityConfig.maxPayloadBytes,
+  handleProtocols: (protocols: Set<string>, _req) => {
+    // 1. Prefer standard application subprotocol so capability tokens are never echoed in HTTP response headers
+    if (protocols.has('converge.v1')) {
+      return 'converge.v1'
+    }
+    if (protocols.has('converge')) {
+      return 'converge'
+    }
+    // 2. If client supplied non-token subprotocol, select it
+    for (const p of protocols) {
+      if (!p.startsWith('converge.token.')) {
+        return p
+      }
+    }
+    // 3. Fallback for legacy single-subprotocol clients
+    for (const p of protocols) {
+      if (p.startsWith('converge.token.')) {
+        return p
+      }
+    }
+    return protocols.values().next().value ?? false
+  },
 })
 
 wss.on('connection', (ws, req) => {
+  if (isShuttingDown) {
+    ws.close(1001, 'Server shutting down')
+    return
+  }
+
   const url = new URL(req.url ?? '/', `http://${HOST}:${PORT}`)
   const roomName = url.pathname.slice(1) || 'default'
 
@@ -275,31 +368,73 @@ wss.on('connection', (ws, req) => {
 })
 
 // Graceful shutdown handling
-const shutdown = async (signal: string) => {
-  console.log(`[lifecycle] Received ${signal}. Shutting down gracefully...`)
+export async function gracefulShutdown(
+  options: { timeoutMs?: number; exitProcess?: boolean } = {}
+): Promise<{ success: boolean; errors: string[] }> {
+  const timeoutMs = options.timeoutMs ?? 10000
+  const exitProcess = options.exitProcess ?? false
+  const errors: string[] = []
 
-  // Close WebSocket server
-  wss.close(() => {
-    console.log('[lifecycle] WebSocket server closed.')
+  console.log('[lifecycle] Initiating graceful shutdown sequence...')
+  isShuttingDown = true
+
+  // 1. Stop accepting new HTTP requests
+  const serverClosePromise = new Promise<void>((resolve) => {
+    server.close(() => {
+      console.log('[lifecycle] HTTP server closed.')
+      resolve()
+    })
   })
 
-  // Close HTTP server
-  server.close(async () => {
-    console.log('[lifecycle] HTTP server closed.')
-    try {
-      await dbPool.end()
-      console.log('[lifecycle] Database pool drained.')
-    } catch (e: any) {
-      console.error('[lifecycle] Error draining DB pool:', e.message)
+  // 2. Stop accepting new WebSocket connections
+  const wssClosePromise = new Promise<void>((resolve) => {
+    wss.close(() => {
+      console.log('[lifecycle] WebSocket server closed.')
+      resolve()
+    })
+  })
+
+  try {
+    // 3. Drain pending room persistence queues and LevelDB writes
+    console.log('[lifecycle] Draining room persistence queues...')
+    const flushRes = await flushAllRooms(Math.max(1000, timeoutMs - 3000))
+    if (flushRes.errors.length > 0) {
+      errors.push(...flushRes.errors)
+      console.warn('[lifecycle] Warnings during persistence flush:', flushRes.errors)
     }
-    process.exit(0)
-  })
 
-  // Force shutdown if cleanup hangs
-  setTimeout(() => {
-    console.error('[lifecycle] Forced shutdown after timeout.')
-    process.exit(1)
-  }, 10000).unref()
+    // 4. Close LevelDB working storage
+    console.log('[lifecycle] Closing LevelDB persistence...')
+    await closePersistence()
+
+    // 5. Terminate client sockets and destroy room docs
+    closeAllRooms()
+
+    // Wait for server socket closures
+    await Promise.all([serverClosePromise, wssClosePromise])
+
+    // 6. Drain database connection pool only after all writes settle
+    console.log('[lifecycle] Draining database pool...')
+    await dbPool.end()
+    console.log('[lifecycle] Database pool drained.')
+
+    if (exitProcess) {
+      process.exit(errors.length > 0 ? 1 : 0)
+    }
+    return { success: errors.length === 0, errors }
+  } catch (err: any) {
+    console.error('[lifecycle] Error during graceful shutdown:', err.message)
+    errors.push(err.message)
+    if (exitProcess) {
+      process.exit(1)
+    }
+    return { success: false, errors }
+  }
+}
+
+const shutdown = (signal: string) => {
+  console.log(`[lifecycle] Received ${signal}. Shutting down gracefully...`)
+  gracefulShutdown({ timeoutMs: 10000, exitProcess: true }).catch(() => process.exit(1))
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'))

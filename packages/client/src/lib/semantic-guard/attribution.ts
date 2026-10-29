@@ -20,10 +20,11 @@ export class ConflictAttributionEngine {
    */
   public static attributeDiagnostics(
     rawDiagnostics: RawDiagnostic[],
-    provenance?: MergeProvenance
+    provenance?: MergeProvenance,
+    baselineDiagnostics?: SemanticDiagnostic[]
   ): SemanticDiagnostic[] {
     return rawDiagnostics.map((raw, idx) => {
-      const attribution = this.computeAttribution(raw, provenance)
+      const attribution = this.computeAttribution(raw, provenance, baselineDiagnostics)
 
       let category = attribution.classification
       let message = raw.message
@@ -59,7 +60,8 @@ export class ConflictAttributionEngine {
 
   private static computeAttribution(
     raw: RawDiagnostic,
-    provenance?: MergeProvenance
+    provenance?: MergeProvenance,
+    baselineDiagnostics?: SemanticDiagnostic[]
   ): ConflictAttribution {
     // 1. Syntactic parse errors are always categorized as SYNTAX_ERROR
     if (raw.isSyntaxError) {
@@ -71,10 +73,50 @@ export class ConflictAttributionEngine {
       }
     }
 
-    // 2. If a remote merge recently occurred, evaluate causal correlation
+    // 2. Pre-existing error check: If the error already existed in baseline before merge,
+    // it was NOT caused by the remote merge!
+    if (baselineDiagnostics && baselineDiagnostics.length > 0) {
+      const existedBefore = baselineDiagnostics.some(
+        (b) =>
+          b.code === raw.code &&
+          (b.fileId === raw.fileId || b.fileName === raw.fileName) &&
+          b.symbolName === raw.symbolName
+      )
+      if (existedBefore) {
+        return {
+          classification: 'STATIC_DIAGNOSTIC',
+          isConcurrentConflict: false,
+          targetSymbol: raw.symbolName,
+          reason: 'Pre-existing diagnostic prior to merge; independent of concurrent edits.',
+          evidence: ['Diagnostic existed in local baseline before remote update arrived.'],
+        }
+      }
+    }
+
+    // 3. If a remote merge recently occurred, evaluate causal correlation
     if (provenance && provenance.occurred) {
       const target = raw.symbolName
       const mutatedList = provenance.mutatedDeclarations || []
+      const declaredList = provenance.declaredSymbols || []
+      const changedFiles = provenance.changedFiles || provenance.changedFileIds || []
+
+      // File Scoping: If changedFiles is populated and does NOT include this file or symbol,
+      // the remote edit was on an unrelated file!
+      const fileTouched =
+        changedFiles.length === 0 ||
+        changedFiles.some((f) => f === raw.fileId || raw.fileName.includes(f) || f.includes(raw.fileName))
+
+      if (!fileTouched && (!target || !mutatedList.includes(target))) {
+        return {
+          classification: 'STATIC_DIAGNOSTIC',
+          isConcurrentConflict: false,
+          targetSymbol: target,
+          reason: 'Remote edit occurred on an unrelated file; independent of this diagnostic.',
+          evidence: [
+            `Remote update touched [${changedFiles.join(', ')}], which does not affect ${raw.fileName}.`,
+          ],
+        }
+      }
 
       // Scenario A: Remote peer mutated or deleted the declaration of target symbol
       const isMutatedTarget =
@@ -99,34 +141,51 @@ export class ConflictAttributionEngine {
 
       // Scenario B: Concurrent duplicate declarations (TS2451 / TS2300)
       if (raw.code === 2451 || raw.code === 2300) {
+        const wasConcurrentlyDeclared =
+          target &&
+          (declaredList.includes(target) || provenance.targetSymbol === target)
+
+        if (wasConcurrentlyDeclared) {
+          return {
+            classification: 'CONFIRMED_CONCURRENT_CONFLICT',
+            isConcurrentConflict: true,
+            targetSymbol: target,
+            remoteClientId: provenance.sourceClientId,
+            reason: `Concurrent duplicate declaration for '${target ?? 'identifier'}' introduced across replicas.`,
+            evidence: [
+              `Both replicas concurrently declared identifier '${target ?? 'variable'}'.`,
+              `CRDT state contains conflicting block-scoped declarations in the same scope.`,
+            ],
+          }
+        }
+
+        // If duplicate declaration was not concurrently introduced by remote peer, classify as STATIC
         return {
-          classification: 'CONFIRMED_CONCURRENT_CONFLICT',
-          isConcurrentConflict: true,
+          classification: 'STATIC_DIAGNOSTIC',
+          isConcurrentConflict: false,
           targetSymbol: target,
-          remoteClientId: provenance.sourceClientId,
-          reason: `Concurrent duplicate declaration for '${target ?? 'identifier'}' introduced across replicas.`,
-          evidence: [
-            `Both replicas concurrently declared identifier '${target ?? 'variable'}'.`,
-            `CRDT state contains conflicting block-scoped declarations in the same scope.`,
-          ],
+          reason: 'Duplicate declaration created locally; independent of remote edit.',
+          evidence: ['Local duplicate declaration.'],
         }
       }
 
-      // Scenario C: Error emerged immediately following merge, but exact symbol causal provenance is uncertain
-      return {
-        classification: 'LIKELY_CONCURRENT_CONFLICT',
-        isConcurrentConflict: true,
-        targetSymbol: target,
-        remoteClientId: provenance.sourceClientId,
-        reason: `Emerged following merge from peer #${provenance.sourceClientId ?? 'remote'}; causal provenance cannot be conclusively established.`,
-        evidence: [
-          `Diagnostic appeared immediately after remote update merge.`,
-          `Uncertainty reported: indirect type propagation or unindexed declaration delta.`,
-        ],
+      // Scenario C: Error emerged immediately following merge in a touched file, but exact symbol causal provenance is uncertain
+      if (fileTouched) {
+        return {
+          classification: 'LIKELY_CONCURRENT_CONFLICT',
+          isConcurrentConflict: true,
+          targetSymbol: target,
+          remoteClientId: provenance.sourceClientId,
+          reason: `Emerged following merge from peer #${provenance.sourceClientId ?? 'remote'}; causal provenance cannot be conclusively established.`,
+          evidence: [
+            `Diagnostic appeared immediately after remote update merge.`,
+            `Uncertainty reported: indirect type propagation or unindexed declaration delta.`,
+          ],
+        }
       }
     }
 
-    // 3. Ordinary single-user static analysis diagnostic
+    // 4. Ordinary single-user static analysis diagnostic
     return {
       classification: 'STATIC_DIAGNOSTIC',
       isConcurrentConflict: false,

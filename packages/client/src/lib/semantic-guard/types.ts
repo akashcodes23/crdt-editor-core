@@ -53,6 +53,8 @@ export interface MergeProvenance {
   mutatedDeclarations?: string[]
   referencedSymbols?: string[]
   changedFiles?: string[]
+  changedFileIds?: string[]
+  declaredSymbols?: string[]
 }
 
 export interface AnalysisRequest {
@@ -61,6 +63,7 @@ export interface AnalysisRequest {
   activeFileId: string
   files: WorkspaceFileSnapshot[]
   provenance?: MergeProvenance
+  baselineDiagnostics?: SemanticDiagnostic[]
   cursorOffset?: number
 }
 
@@ -75,5 +78,6 @@ export interface AnalysisResponse {
 
 export interface IAnalysisWorker {
   analyze(request: AnalysisRequest): Promise<AnalysisResponse>
+  cancel?(requestId: string, version: number): void
   dispose(): void
 }

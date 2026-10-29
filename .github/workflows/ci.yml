@@ -47,14 +47,15 @@ jobs:
       - name: Typecheck Workspace
         run: pnpm typecheck
 
-      - name: Run Convergence Tests
-        run: pnpm --filter server test
+      - name: Run Automated Test Suites
+        run: pnpm test
         env:
+          DATABASE_URL: postgresql://crdt:password@localhost:5432/crdthistory
           PGHOST: localhost
           PGPORT: 5432
           PGUSER: crdt
           PGPASSWORD: password
           PGDATABASE: crdthistory
 
-      - name: Build Frontend Application
-        run: pnpm --filter client build
+      - name: Build Application Workspace
+        run: pnpm build

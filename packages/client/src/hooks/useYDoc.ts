@@ -2,9 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as Y from 'yjs'
-import { WebsocketProvider } from 'y-websocket'
 import { IndexeddbPersistence } from 'y-indexeddb'
 import { WS_URL, ROOM_NAME } from '@/lib/yjs'
+import { DurableSyncClient, type SaveState } from '@/lib/durable-client'
 
 export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
 
@@ -21,8 +21,10 @@ export interface SyncBytes {
 
 export interface UseYDocResult {
   doc: Y.Doc | null
-  provider: WebsocketProvider | null
+  provider: DurableSyncClient | null
   status: ConnectionStatus
+  saveState: SaveState
+  retryFailedUpdates: () => Promise<void>
   disconnect: () => void
   reconnect: () => void
   startChaos: () => void
@@ -36,13 +38,20 @@ const CHAOS_SECONDS = 30
 
 export function useYDoc(clientLabel: string): UseYDocResult {
   const docRef         = useRef<Y.Doc | null>(null)
-  const providerRef    = useRef<WebsocketProvider | null>(null)
+  const providerRef    = useRef<DurableSyncClient | null>(null)
   const idbRef         = useRef<IndexeddbPersistence | null>(null)
   const chaosTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null)
   const offlineListRef = useRef<((u: Uint8Array) => void) | null>(null)
   const firstUpdateRef = useRef<((u: Uint8Array) => void) | null>(null)
 
   const [status,          setStatus]          = useState<ConnectionStatus>('connecting')
+  const [saveState,       setSaveState]       = useState<SaveState>({
+    overallStatus: 'durable',
+    pendingCount: 0,
+    durableCount: 0,
+    failedCount: 0,
+    unknownCount: 0,
+  })
   const [chaos,           setChaos]           = useState<ChaosState>({ active: false, countdown: CHAOS_SECONDS, divergedChars: 0 })
   const [mergeFlashRange, setMergeFlashRange] = useState<{ start: number; end: number } | null>(null)
   const [syncBytes,       setSyncBytes]       = useState<SyncBytes | null>(null)
@@ -52,7 +61,11 @@ export function useYDoc(clientLabel: string): UseYDocResult {
     docRef.current = doc
     const idb = new IndexeddbPersistence(`crdt-editor-${clientLabel}`, doc)
     idbRef.current = idb
-    const provider = new WebsocketProvider(WS_URL, ROOM_NAME, doc, { connect: true })
+    const provider = new DurableSyncClient(`${WS_URL}/${ROOM_NAME}`, doc, {
+      connect: true,
+      autoSubmit: true,
+      token: process.env.NEXT_PUBLIC_CONVERGE_TOKEN,
+    })
     providerRef.current = provider
     provider.on('status', ({ status: s }: { status: string }) => {
       if (s === 'connected')       setStatus('connected')
@@ -60,6 +73,9 @@ export function useYDoc(clientLabel: string): UseYDocResult {
       else                           setStatus('connecting')
     })
     provider.on('connection-error', () => setStatus('disconnected'))
+    provider.on('save-status', (state: SaveState) => {
+      setSaveState(state)
+    })
     return () => {
       if (chaosTimerRef.current)  clearInterval(chaosTimerRef.current)
       if (offlineListRef.current) doc.off('update', offlineListRef.current)
@@ -168,10 +184,18 @@ export function useYDoc(clientLabel: string): UseYDocResult {
 
   const clearMergeFlash = useCallback(() => setMergeFlashRange(null), [])
 
+  const retryFailedUpdates = useCallback(async () => {
+    if (providerRef.current) {
+      await providerRef.current.retryAllUnconfirmed()
+    }
+  }, [])
+
   return {
     doc: docRef.current,
     provider: providerRef.current,
     status,
+    saveState,
+    retryFailedUpdates,
     disconnect,
     reconnect,
     startChaos,

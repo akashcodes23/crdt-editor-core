@@ -24,6 +24,7 @@ export class SemanticGuardPipeline {
   private onDiagnosticsUpdated?: (fileId: string, diagnostics: SemanticDiagnostic[]) => void
   private monacoInstance: any = null
   private currentModel: any = null
+  private activeFileId: string | null = null
 
   constructor(worker?: IAnalysisWorker, debounceMs: number = 200) {
     this.scheduler = new DebouncedAnalysisScheduler(worker, debounceMs)
@@ -38,6 +39,22 @@ export class SemanticGuardPipeline {
   }
 
   /**
+   * Switch active file and Monaco model, clearing markers from previous model
+   * and restoring cached markers onto the new model.
+   */
+  public switchActiveFile(newFileId: string, model: any): void {
+    this.activeFileId = newFileId
+    if (this.monacoInstance && this.currentModel && this.currentModel !== model) {
+      MonacoDiagnosticAdapter.clearMarkers(this.monacoInstance, this.currentModel)
+    }
+    this.currentModel = model
+    const cached = this.latestDiagnostics.get(newFileId)
+    if (this.monacoInstance && model && cached) {
+      MonacoDiagnosticAdapter.applyMarkers(this.monacoInstance, model, cached)
+    }
+  }
+
+  /**
    * Set callback listener for diagnostics updates.
    */
   public onUpdate(callback: (fileId: string, diagnostics: SemanticDiagnostic[]) => void): void {
@@ -48,7 +65,33 @@ export class SemanticGuardPipeline {
    * Record that a remote merge / sync event occurred.
    */
   public recordMergeEvent(provenance: MergeProvenance): void {
-    this.pendingProvenance = provenance
+    if (!this.pendingProvenance) {
+      this.pendingProvenance = { ...provenance }
+      return
+    }
+
+    // Merge existing pending provenance
+    const existing = this.pendingProvenance
+    const changedSet = new Set<string>([
+      ...(existing.changedFileIds || []),
+      ...(provenance.changedFileIds || []),
+    ])
+    const mutatedSet = new Set<string>([
+      ...(existing.mutatedDeclarations || []),
+      ...(provenance.mutatedDeclarations || []),
+    ])
+    const declaredSet = new Set<string>([
+      ...(existing.declaredSymbols || []),
+      ...(provenance.declaredSymbols || []),
+    ])
+
+    this.pendingProvenance = {
+      occurred: existing.occurred || provenance.occurred,
+      sourceClientId: provenance.sourceClientId ?? existing.sourceClientId,
+      changedFileIds: changedSet.size > 0 ? Array.from(changedSet) : undefined,
+      mutatedDeclarations: mutatedSet.size > 0 ? Array.from(mutatedSet) : undefined,
+      declaredSymbols: declaredSet.size > 0 ? Array.from(declaredSet) : undefined,
+    }
   }
 
   /**
@@ -58,7 +101,9 @@ export class SemanticGuardPipeline {
     activeFileId: string,
     files: WorkspaceFileSnapshot[]
   ): { version: number; requestId: string } {
+    this.activeFileId = activeFileId
     const provenance = this.pendingProvenance ?? undefined
+    const baselineDiagnostics = this.latestDiagnostics.get(activeFileId) || []
     // Clear pending provenance once consumed by request
     this.pendingProvenance = null
 
@@ -67,6 +112,7 @@ export class SemanticGuardPipeline {
         activeFileId,
         files,
         provenance,
+        baselineDiagnostics,
       },
       (response: AnalysisResponse) => {
         this.handleAnalysisComplete(activeFileId, response)
@@ -82,7 +128,9 @@ export class SemanticGuardPipeline {
     files: WorkspaceFileSnapshot[],
     provenance?: MergeProvenance
   ): Promise<AnalysisResponse> {
+    this.activeFileId = activeFileId
     const effectiveProvenance = provenance ?? this.pendingProvenance ?? undefined
+    const baselineDiagnostics = this.latestDiagnostics.get(activeFileId) || []
     this.pendingProvenance = null
 
     return this.scheduler.flushImmediately(
@@ -90,6 +138,7 @@ export class SemanticGuardPipeline {
         activeFileId,
         files,
         provenance: effectiveProvenance,
+        baselineDiagnostics,
       },
       (response: AnalysisResponse) => {
         this.handleAnalysisComplete(activeFileId, response)
@@ -97,16 +146,20 @@ export class SemanticGuardPipeline {
     )
   }
 
-  private handleAnalysisComplete(activeFileId: string, response: AnalysisResponse): void {
-    // Filter diagnostics for the active file
+  private handleAnalysisComplete(targetFileId: string, response: AnalysisResponse): void {
+    if (response.isStale) {
+      return
+    }
+
+    // Filter diagnostics for the target file
     const activeFileDiags = response.diagnostics.filter(
-      (d) => d.fileId === activeFileId || d.fileName.includes(activeFileId)
+      (d) => d.fileId === targetFileId || d.fileName.includes(targetFileId)
     )
 
-    this.latestDiagnostics.set(activeFileId, activeFileDiags)
+    this.latestDiagnostics.set(targetFileId, activeFileDiags)
 
-    // Apply markers to Monaco model if bound
-    if (this.monacoInstance && this.currentModel) {
+    // Apply markers to Monaco model ONLY if this file is still the active file
+    if (this.monacoInstance && this.currentModel && this.activeFileId === targetFileId) {
       MonacoDiagnosticAdapter.applyMarkers(
         this.monacoInstance,
         this.currentModel,
@@ -115,7 +168,7 @@ export class SemanticGuardPipeline {
     }
 
     if (this.onDiagnosticsUpdated) {
-      this.onDiagnosticsUpdated(activeFileId, activeFileDiags)
+      this.onDiagnosticsUpdated(targetFileId, activeFileDiags)
     }
   }
 
@@ -135,6 +188,18 @@ export class SemanticGuardPipeline {
 
   public getDiagnostics(fileId: string): SemanticDiagnostic[] {
     return this.latestDiagnostics.get(fileId) || []
+  }
+
+  public getScheduler(): DebouncedAnalysisScheduler {
+    return this.scheduler
+  }
+
+  public getActiveFileId(): string | null {
+    return this.activeFileId
+  }
+
+  public getDisplayedVersion(): number {
+    return this.scheduler.getDisplayedVersion()
   }
 
   public dispose(): void {
